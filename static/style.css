@@ -119,6 +119,7 @@ body::before {
   user-select: none;
 }
 .auto-sync input { accent-color: var(--accent); cursor: pointer; }
+.auto-sync .select { padding: 3px 8px; font-size: 12px; border-radius: 8px; }
 
 /* ========== 视图 ========== */
 .view { display: none; animation: fade 0.25s ease; }
@@ -208,9 +209,13 @@ body::before {
 .es-label { font-size: 11px; color: var(--text-faint); }
 .es-value { font-size: 15px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
 .entity-spark { height: 56px; margin-top: 12px; }
+.price-edit { margin-left: auto; width: 26px; height: 26px; font-size: 12px; flex-shrink: 0; }
 
 /* ========== 表格 ========== */
 .table-wrap { overflow-x: auto; }
+.rec-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.rec-controls input[type="date"] { max-width: 150px; }
+.rec-controls .select { width: auto; }
 .table { width: 100%; border-collapse: collapse; font-size: 12.8px; }
 .table th {
   text-align: left; padding: 9px 10px; color: var(--text-faint);
@@ -267,6 +272,16 @@ body::before {
   width: 30px; height: 30px; border-radius: 9px; cursor: pointer; font-size: 13px;
 }
 .icon-btn:hover { color: #fff; background: rgba(255,255,255,0.12); }
+
+/* ========== Plan 用量 ========== */
+.plan-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.plan-toolbar .btn-primary { width: auto; }
+.plan-win { padding: 8px 0; }
+.plan-win + .plan-win { border-top: 1px solid var(--card-border); }
+.plan-win-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+.plan-bar { height: 8px; border-radius: 6px; background: rgba(255,255,255,0.07); overflow: hidden; }
+.plan-bar i { display: block; height: 100%; border-radius: 6px; transition: width 0.4s ease; }
+.plan-sub { margin-top: 8px; font-size: 12px; color: var(--text-faint); line-height: 1.6; }
 
 /* ========== 弹窗 / 表单 ========== */
 .modal-mask { display: flex; align-items: center; justify-content: center; }

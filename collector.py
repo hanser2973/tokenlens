@@ -123,6 +123,128 @@ SOURCES = [
     ("Codex CLI",   "~/.codex/sessions/**/rollout-*.jsonl",          "codex"),
 ]
 
+_KIND_PATTERNS = {kind: pattern for _, pattern, kind in SOURCES}
+
+
+def _parser_for(kind, state):
+    if kind == "kimi":
+        return parse_kimi
+    if kind == "claude":
+        return make_claude_parser(state)
+    return make_codex_parser()
+
+
+def usage_since(kind, since_ts):
+    """精确汇总某工具 since_ts 之后的事件级用量（用于套餐窗口估算）。没有该工具返回 None。"""
+    pattern = _KIND_PATTERNS.get(kind)
+    if not pattern:
+        return None
+    total = {"input": 0, "output": 0, "cached": 0, "requests": 0}
+    state = {}
+    for path in glob.glob(os.path.expanduser(pattern), recursive=True):
+        try:
+            if os.path.getmtime(path) < since_ts - 3600:  # 留 1h 余量，过老的文件直接跳过
+                continue
+            with open(path, "rb") as f:
+                chunk = f.read()
+        except OSError:
+            continue
+        parse = _parser_for(kind, state)
+        for raw in chunk.split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                ev = parse(raw.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if not ev or ev["ts"] < since_ts:
+                continue
+            total["input"] += ev["input"]
+            total["output"] += ev["output"]
+            total["cached"] += ev["cached"]
+            total["requests"] += 1
+    return total
+
+
+def breakdown(day, hour=None):
+    """扫描原始日志，返回指定日期按小时（或指定小时按分钟）分桶的明细行。
+
+    day: 'YYYY-MM-DD'；hour: 0-23 或 None。
+    返回 [{bucket, agent, model, input, output, cached, requests}]，
+    bucket 形如 '13'（按小时）或 '13:42'（按分钟）。只含自动采集数据。
+    """
+    day_start = datetime.strptime(day, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+    buckets = {}
+    for agent, pattern, kind in SOURCES:
+        state = {}
+        for path in glob.glob(os.path.expanduser(pattern), recursive=True):
+            try:
+                if os.path.getmtime(path) < day_start - 3600:
+                    continue
+                with open(path, "rb") as f:
+                    chunk = f.read()
+            except OSError:
+                continue
+            parse = _parser_for(kind, state)
+            for raw in chunk.split(b"\n"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ev = parse(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if not ev or not (day_start <= ev["ts"] < day_end):
+                    continue
+                dt = datetime.fromtimestamp(ev["ts"])
+                if hour is not None and dt.hour != hour:
+                    continue
+                b = f"{dt.hour:02d}" if hour is None else f"{dt.hour:02d}:{dt.minute:02d}"
+                key = (b, agent, ev["model"])
+                slot = buckets.setdefault(key, {"input": 0, "output": 0, "cached": 0, "requests": 0})
+                slot["input"] += ev["input"]
+                slot["output"] += ev["output"]
+                slot["cached"] += ev["cached"]
+                slot["requests"] += 1
+    rows = [
+        {"bucket": b, "agent": a, "model": m, **v}
+        for (b, a, m), v in buckets.items()
+    ]
+    rows.sort(key=lambda r: (r["bucket"], r["agent"], r["model"]))
+    return rows
+
+
+def latest_rate_limits(max_files=15, tail=1 << 20):
+    """从 Codex 日志尾部找最新的 rate_limits（套餐窗口用量百分比）。找不到返回 None。"""
+    files = []
+    for path in glob.glob(os.path.expanduser(_KIND_PATTERNS["codex"]), recursive=True):
+        try:
+            files.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    files.sort(reverse=True)
+    for _, path in files[:max_files]:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - tail))
+                chunk = f.read()
+        except OSError:
+            continue
+        for raw in reversed(chunk.split(b"\n")):
+            if b"rate_limits" not in raw:
+                continue
+            try:
+                d = json.loads(raw.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            rl = (d.get("payload") or {}).get("rate_limits")
+            if rl:
+                return {"rate_limits": rl, "timestamp": d.get("timestamp")}
+    return None
+
 
 # ---------- 存储 ----------
 

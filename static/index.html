@@ -32,11 +32,21 @@
       <button class="nav-item" data-view="records">
         <span class="nav-ico">☰</span> 明细记录
       </button>
+      <button class="nav-item" data-view="plans">
+        <span class="nav-ico">◔</span> Plan 用量
+      </button>
     </nav>
     <div class="sidebar-foot">
       <button class="btn-ghost" id="btn-sync">⟳ 同步本地数据</button>
       <button class="btn-primary" id="btn-add">＋ 录入数据</button>
-      <label class="auto-sync"><input type="checkbox" id="chk-auto-sync"> 自动同步（每 2 分钟）</label>
+      <label class="auto-sync"><input type="checkbox" id="chk-auto-sync"> 自动同步
+        <select class="select" id="sel-sync-interval">
+          <option value="10000">10s</option>
+          <option value="30000">30s</option>
+          <option value="60000" selected>60s</option>
+          <option value="300000">300s</option>
+        </select>
+      </label>
       <div class="foot-tip" id="foot-tip"></div>
     </div>
   </aside>
@@ -102,6 +112,10 @@
 
     <!-- 模型 -->
     <section id="view-models" class="view">
+      <div class="plan-toolbar">
+        <span class="card-hint">订阅制模型按官方 API 参考价估算，不代表真实扣费；点卡片上的 ✎ 可改价</span>
+        <button class="btn-ghost" id="btn-import-prices">⇓ 从 models.dev 导入官方价格</button>
+      </div>
       <div class="entity-grid" id="model-cards"></div>
     </section>
 
@@ -116,6 +130,16 @@
         <div class="card-head">
           <div class="card-title">全部记录</div>
           <span class="card-hint" id="records-count"></span>
+        </div>
+        <div class="rec-controls">
+          <div class="seg small" id="rec-gran-seg">
+            <button data-gran="day" class="active">按天</button>
+            <button data-gran="hour">按小时</button>
+            <button data-gran="minute">按分钟</button>
+          </div>
+          <input type="date" id="rec-date" hidden>
+          <select id="rec-hour" class="select" hidden></select>
+          <span class="card-hint" id="rec-gran-hint" hidden>小时/分钟粒度来自本机原始日志，仅含自动采集数据</span>
         </div>
         <div class="table-wrap">
           <table class="table">
@@ -132,6 +156,14 @@
           </table>
         </div>
       </div>
+    </section>
+    <!-- Plan 用量 -->
+    <section id="view-plans" class="view">
+      <div class="plan-toolbar">
+        <span class="card-hint">Kimi / Codex 自动读取官方配额；其他工具可添加配额手动跟踪</span>
+        <button class="btn-primary" id="btn-add-plan">＋ 添加配额</button>
+      </div>
+      <div class="entity-grid" id="plan-cards"></div>
     </section>
   </main>
 </div>
@@ -196,6 +228,77 @@
       </div>
       <div class="form-tip" id="cost-tip"></div>
       <button type="submit" class="btn-primary wide">保存记录</button>
+    </form>
+  </div>
+</div>
+
+<!-- 添加配额弹窗 -->
+<div class="modal-mask" id="plan-modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">添加套餐配额</div>
+      <button class="icon-btn" id="plan-modal-close">✕</button>
+    </div>
+    <form id="plan-form" class="form">
+      <div class="form-row">
+        <label>名称</label>
+        <input type="text" name="pname" placeholder="留空自动命名，如 Kimi Code · 每周配额">
+      </div>
+      <div class="form-row">
+        <label>Agent</label>
+        <input type="text" name="agent" list="dl-agents" placeholder="如 Kimi Code" required>
+      </div>
+      <div class="form-row">
+        <label>周期</label>
+        <select name="period" class="select">
+          <option value="5h">5 小时窗口</option>
+          <option value="week" selected>每周（近 7 天）</option>
+          <option value="month" >每月（近 30 天）</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>跟踪方式</label>
+        <select name="mode" class="select" id="plan-mode">
+          <option value="percent" selected>填当前已用百分比（自动估算总额）</option>
+          <option value="quota">填配额总量（Tokens）</option>
+        </select>
+      </div>
+      <div class="form-row" id="plan-pct-row">
+        <label>当前已用（%）</label>
+        <input type="number" name="pct" min="0.1" max="99.9" step="0.1" placeholder="如 45">
+      </div>
+      <div class="form-row" id="plan-quota-row" hidden>
+        <label>配额（Tokens）</label>
+        <input type="number" name="quota" min="1" placeholder="如 10000000">
+      </div>
+      <div class="form-tip" id="plan-tip">百分比可在工具的用量页查看（如 Kimi CLI 输入 /usage）；填入后按本机采集数据锚定估算总额与剩余，之后自动跟踪。</div>
+      <button type="submit" class="btn-primary wide">保存配额</button>
+    </form>
+  </div>
+</div>
+
+<!-- 价格编辑弹窗 -->
+<div class="modal-mask" id="price-modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">编辑模型价格</div>
+      <button class="icon-btn" id="price-modal-close">✕</button>
+    </div>
+    <form id="price-form" class="form">
+      <div class="form-row">
+        <label>模型</label>
+        <input type="text" name="model" readonly>
+      </div>
+      <div class="form-grid">
+        <div class="form-row"><label>输入价（$/百万）</label><input type="number" name="input" min="0" step="0.01" required></div>
+        <div class="form-row"><label>输出价（$/百万）</label><input type="number" name="output" min="0" step="0.01" required></div>
+      </div>
+      <div class="form-row">
+        <label>缓存读取价（$/百万，留空按输入价 1 折）</label>
+        <input type="number" name="cache_read" min="0" step="0.01" placeholder="自动 = 输入价 × 0.1">
+      </div>
+      <div class="form-tip">订阅制模型为官方 API 参考价，仅供估算，不代表真实扣费。保存后历史记录费用会按新价格重算。</div>
+      <button type="submit" class="btn-primary wide">保存价格</button>
     </form>
   </div>
 </div>

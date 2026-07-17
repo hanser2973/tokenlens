@@ -14,6 +14,9 @@
     agent: "all",
     model: "all",
     metric: "tokens", // tokens | cost
+    recGran: "day",   // day | hour | minute（明细记录粒度）
+    recDate: "",
+    recHour: 0,
   };
 
   const PALETTE = ["#7c5cff", "#38bdf8", "#ff8a5c", "#34d399", "#f472b6", "#fbbf24", "#a3e635", "#c084fc", "#22d3ee", "#fb7185"];
@@ -301,6 +304,7 @@
             <div class="entity-name">${esc(m.name)}</div>
             <div class="entity-sub">${m.days} 天活跃 · 占比 ${share}%</div>
           </div>
+          ${type === "model" ? `<button class="icon-btn price-edit" data-name="${esc(m.name)}" title="编辑价格">✎</button>` : ""}
         </div>
         <div class="entity-stats">
           <div><div class="es-label">总 Tokens</div><div class="es-value">${fmtNum(m.tokens)}</div></div>
@@ -338,6 +342,8 @@
 
     el.querySelectorAll(".entity-card").forEach((card) =>
       card.addEventListener("click", () => openDrawer(card.dataset.type, card.dataset.name)));
+    el.querySelectorAll(".price-edit").forEach((btn) =>
+      btn.addEventListener("click", (e) => { e.stopPropagation(); openPriceModal(btn.dataset.name); }));
   }
 
   /* ---------- 渲染：记录表 ---------- */
@@ -373,6 +379,46 @@
     }));
   }
 
+  /* ---------- 渲染：小时/分钟时间线 ---------- */
+  async function renderTimeline() {
+    const tbody = $("#records-tbody");
+    const params = new URLSearchParams({ day: state.recDate });
+    if (state.recGran === "minute") params.set("hour", state.recHour);
+    $("#records-count").textContent = "加载中…";
+    tbody.innerHTML = `<tr><td colspan="11" class="empty">加载中…</td></tr>`;
+    let data;
+    try {
+      const res = await fetch("/api/timeline?" + params.toString());
+      data = await res.json();
+      if (!res.ok) throw new Error(data.error || "加载失败");
+    } catch (e) {
+      $("#records-count").textContent = "";
+      tbody.innerHTML = `<tr><td colspan="11" class="empty">${esc(e.message || "加载失败")}</td></tr>`;
+      return;
+    }
+    let rows = data.rows || [];
+    if (state.agent !== "all") rows = rows.filter((r) => r.agent === state.agent);
+    if (state.model !== "all") rows = rows.filter((r) => r.model === state.model);
+    $("#records-count").textContent = `${data.day}${state.recGran === "minute" ? " " + String(state.recHour).padStart(2, "0") + " 时" : ""} · 共 ${rows.length} 条`;
+    tbody.innerHTML = rows.map((r) => {
+      const label = state.recGran === "hour" ? `${r.bucket}:00` : r.bucket;
+      return `
+      <tr>
+        <td>${label}</td>
+        <td><span class="tag"><i style="background:${colorOf(r.agent)}"></i>${esc(r.agent)}</span></td>
+        <td><span class="tag"><i style="background:${colorOf(r.model)}"></i>${esc(r.model)}</span></td>
+        <td class="num">${fmtFull(r.requests)}</td>
+        <td class="num">${fmtFull(r.input)}</td>
+        <td class="num">${fmtFull(r.output)}</td>
+        <td class="num">${fmtFull(r.cached)}</td>
+        <td class="num">${hitRate(r)}</td>
+        <td class="num"><b>${fmtFull(totalTokens(r))}</b></td>
+        <td class="num">${fmtCost(r.cost || 0)}</td>
+        <td class="num"><span class="auto-badge">自动</span></td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="11" class="empty">该时段没有采集到数据（小时/分钟粒度仅含自动采集数据，手动记录请切回「按天」）</td></tr>`;
+  }
+
   /* ---------- 抽屉 ---------- */
   function openDrawer(type, name) {
     const list = state.records.filter((r) => r[type] === name);
@@ -396,8 +442,8 @@
       ["输出", fmtNum(output)],
       ["缓存", fmtNum(cached)],
     ].map(([l, v]) => `<div class="ds"><div class="ds-label">${l}</div><div class="ds-value">${v}</div></div>`).join("")
-      + (type === "model" && state.prices[name]
-        ? `<div class="ds"><div class="ds-label">单价（入/出 每百万）</div><div class="ds-value">$${state.prices[name].input} / $${state.prices[name].output}</div></div>`
+      + (type === "model" && state.prices[String(name).toLowerCase()]
+        ? `<div class="ds"><div class="ds-label">单价（入/出 每百万）</div><div class="ds-value">$${state.prices[String(name).toLowerCase()].input} / $${state.prices[String(name).toLowerCase()].output}</div></div>`
         : `<div class="ds"><div class="ds-label">关联${type === "model" ? "Agent" : "模型"}数</div><div class="ds-value">${others.size}</div></div>`);
 
     $("#drawer-mask").classList.add("show");
@@ -465,6 +511,16 @@
   }
   function closeModal() { $("#modal-mask").classList.remove("show"); }
 
+  function openPriceModal(model) {
+    const f = $("#price-form");
+    const p = state.prices[String(model).toLowerCase()] || {};
+    f.model.value = model;
+    f.input.value = p.input != null ? p.input : "";
+    f.output.value = p.output != null ? p.output : "";
+    f.cache_read.value = p.cache_read != null ? p.cache_read : "";
+    $("#price-modal-mask").classList.add("show");
+  }
+
   function buildDatalists() {
     const agents = [...new Set([...state.agents, ...state.records.map((r) => r.agent)])];
     const models = [...new Set([...Object.keys(state.prices), ...state.records.map((r) => r.model)])];
@@ -475,13 +531,14 @@
   function updateCostTip() {
     const f = $("#add-form");
     const model = f.model.value.trim();
-    const p = state.prices[model];
+    const p = state.prices[model.toLowerCase()];
     const input = +f.input.value || 0, output = +f.output.value || 0, cached = +f.cached.value || 0;
     if (!p) {
-      $("#cost-tip").textContent = model ? "该模型暂无价格信息，费用将记为 0，可手动填写。" : "";
+      $("#cost-tip").textContent = model ? "该模型暂无价格信息，费用将记为 0，可在「模型」页点 ✎ 录入价格。" : "";
       return;
     }
-    const cost = (input * p.input + output * p.output + cached * p.input * 0.1) / 1e6;
+    const cachePrice = p.cache_read != null ? p.cache_read : p.input * 0.1;
+    const cost = (input * p.input + output * p.output + cached * cachePrice) / 1e6;
     $("#cost-tip").textContent = `按 ${model} 价目估算费用：${fmtCost(cost)}`;
   }
 
@@ -525,7 +582,7 @@
     $("#filter-model").innerHTML = `<option value="all">全部模型</option>` + models.map((m) => `<option ${m === keepM ? "selected" : ""} value="${esc(m)}">${esc(m)}</option>`).join("");
   }
 
-  const VIEW_TITLES = { overview: "总览", models: "模型", agents: "Agent", records: "明细记录" };
+  const VIEW_TITLES = { overview: "总览", models: "模型", agents: "Agent", records: "明细记录", plans: "Plan 用量" };
 
   function switchView(view) {
     state.view = view;
@@ -555,8 +612,93 @@
     } else if (state.view === "agents") {
       renderEntityCards(list, "agent", "#agent-cards", "agent");
     } else if (state.view === "records") {
-      renderRecords(list);
+      if (state.recGran === "day") renderRecords(list);
+      else renderTimeline();
+    } else if (state.view === "plans") {
+      renderPlans();
     }
+  }
+
+  /* ---------- Plan 用量 ---------- */
+  function planColor(pct) { return pct >= 85 ? "#fb7185" : pct >= 60 ? "#fbbf24" : "#34d399"; }
+
+  function fmtReset(resetsAt) {
+    let s = Math.max(0, Math.round(resetsAt - Date.now() / 1000));
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60);
+    const parts = d ? `${d} 天` : h ? `${h} 小时` : `${m} 分钟`;
+    return `${parts}后重置`;
+  }
+
+  function planWinHtml(pct, title, sub) {
+    pct = Math.min(100, pct);
+    return `
+      <div class="plan-win">
+        <div class="plan-win-head"><span>${title}</span><span style="color:${planColor(pct)}">已用 ${pct}%</span></div>
+        <div class="plan-bar"><i style="width:${pct}%;background:${planColor(pct)}"></i></div>
+        <div class="plan-sub">${sub}</div>
+      </div>`;
+  }
+
+  async function renderPlans() {
+    const box = $("#plan-cards");
+    let data;
+    try {
+      const res = await fetch("/api/plans");
+      data = await res.json();
+    } catch (e) {
+      box.innerHTML = `<div class="card"><div class="card-hint">加载失败，请重试</div></div>`;
+      return;
+    }
+    const cards = [];
+    for (const a of data.auto || []) {
+      if (a.error) {
+        cards.push(`
+        <div class="card plan-card">
+          <div class="card-head"><div class="card-title">${esc(a.agent)}</div><span class="card-hint">官方接口</span></div>
+          <div class="plan-sub">${esc(a.error)}</div>
+        </div>`);
+        continue;
+      }
+      const wins = (a.windows || []).map((w) => {
+        const subs = [];
+        if (w.resets_at) subs.push(fmtReset(w.resets_at));
+        subs.push(`本窗口采集 ${fmtNum(w.measured_tokens)} tokens`);
+        if (w.est_quota) {
+          const tag = w.est_carried ? "（跨设备校准）" : "";
+          subs.push(`估算总额 ≈ ${fmtNum(w.est_quota)}${tag} · 剩余 ≈ ${fmtNum(w.est_remaining)}`);
+        } else {
+          subs.push("暂无足够数据估算绝对额度");
+        }
+        return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "));
+      }).join("");
+      const updated = (a.updated || "").replace("T", " ").slice(5, 16);
+      cards.push(`
+      <div class="card plan-card">
+        <div class="card-head"><div class="card-title">${esc(a.agent)} · ${esc(a.plan_type)}</div><span class="card-hint">${esc(a.note || "官方数据")} · ${esc(updated)}</span></div>
+        ${wins}
+      </div>`);
+    }
+    for (const p of data.manual || []) {
+      let sub;
+      if (p.mode === "percent") {
+        sub = p.est_quota
+          ? `已用 ${fmtFull(p.used)} · 估算总额 ≈ ${fmtNum(p.est_quota)} · 剩余 ≈ ${fmtNum(p.remaining)}（按 ${p.anchor_pct}% 锚定）`
+          : `锚定时本窗口无采集数据，暂无法估算总额（当前已用 ${p.pct}%）`;
+      } else {
+        sub = `已用 ${fmtFull(p.used)} / 配额 ${fmtFull(p.quota)} · 剩余 ${fmtFull(p.remaining)}`;
+      }
+      cards.push(`
+      <div class="card plan-card">
+        <div class="card-head"><div class="card-title">${esc(p.name)}</div><button class="icon-btn plan-del" data-id="${p.id}" title="删除配额">✕</button></div>
+        ${planWinHtml(p.pct, `${esc(p.agent)} · ${esc(p.period_label)}`, sub)}
+      </div>`);
+    }
+    if (!cards.length) {
+      cards.push(`<div class="card"><div class="card-hint">暂无 Plan 数据：未发现 Codex 限额记录，可点右上「添加配额」手动跟踪 Kimi / Claude 等套餐。</div></div>`);
+    }
+    box.innerHTML = cards.join("");
   }
 
   /* ---------- 事件绑定 ---------- */
@@ -597,28 +739,158 @@
     $("#btn-add").addEventListener("click", openModal);
     $("#btn-sync").addEventListener("click", syncData);
 
-    // 自动同步：每 2 分钟静默采集一次并刷新（后台本来也有 10 分钟扫描，这里让页面数据更及时）
+    // 自动同步：按选定间隔静默采集一次并刷新（后台本来也有 10 分钟扫描，这里让页面数据更及时）
     let autoSyncTimer = null;
-    $("#chk-auto-sync").addEventListener("change", (e) => {
+    const INTERVAL_KEY = "tokenlens.syncInterval";
+    const selInterval = $("#sel-sync-interval");
+    const savedInterval = localStorage.getItem(INTERVAL_KEY);
+    if (savedInterval && [...selInterval.options].some((o) => o.value === savedInterval)) {
+      selInterval.value = savedInterval;
+    }
+    const intervalLabel = () => selInterval.options[selInterval.selectedIndex].text;
+
+    function restartAutoSync() {
       clearInterval(autoSyncTimer);
       autoSyncTimer = null;
-      if (e.target.checked) {
-        autoSyncTimer = setInterval(async () => {
-          try {
-            await fetch("/api/collect", { method: "POST" });
-            await loadData();
-          } catch (err) { /* 静默失败，下轮再试 */ }
-        }, 120000);
-        toast("已开启自动同步（每 2 分钟）");
-      } else {
-        toast("已关闭自动同步");
-      }
+      if (!$("#chk-auto-sync").checked) return;
+      autoSyncTimer = setInterval(async () => {
+        try {
+          await fetch("/api/collect", { method: "POST" });
+          await loadData();
+        } catch (err) { /* 静默失败，下轮再试 */ }
+      }, Number(selInterval.value));
+    }
+
+    $("#chk-auto-sync").addEventListener("change", (e) => {
+      restartAutoSync();
+      toast(e.target.checked ? `已开启自动同步（每 ${intervalLabel()}）` : "已关闭自动同步");
+    });
+    selInterval.addEventListener("change", () => {
+      localStorage.setItem(INTERVAL_KEY, selInterval.value);
+      restartAutoSync();  // 已开启时立即按新间隔生效
+      if ($("#chk-auto-sync").checked) toast(`自动同步间隔已调整为 ${intervalLabel()}`);
     });
     $("#modal-close").addEventListener("click", closeModal);
     $("#modal-mask").addEventListener("click", (e) => { if (e.target.id === "modal-mask") closeModal(); });
+
+    // Plan 配额弹窗与删除
+    const planMask = $("#plan-modal-mask");
+    const closePlanModal = () => planMask.classList.remove("show");
+    $("#btn-add-plan").addEventListener("click", () => { buildDatalists(); planMask.classList.add("show"); });
+    $("#plan-modal-close").addEventListener("click", closePlanModal);
+    planMask.addEventListener("click", (e) => { if (e.target === planMask) closePlanModal(); });
+    $("#plan-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const payload = {
+        name: f.pname.value.trim(),
+        agent: f.agent.value.trim(),
+        period: f.period.value,
+        mode: f.mode.value,
+      };
+      if (payload.mode === "percent") payload.pct = +f.pct.value || 0;
+      else payload.quota = +f.quota.value || 0;
+      const res = await fetch("/api/plans", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        toast("已保存配额");
+        closePlanModal();
+        f.reset();
+        togglePlanMode();
+        renderPlans();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toast(err.error || "保存失败");
+      }
+    });
+    function togglePlanMode() {
+      const percent = $("#plan-mode").value === "percent";
+      $("#plan-pct-row").hidden = !percent;
+      $("#plan-quota-row").hidden = percent;
+      $("#plan-tip").textContent = percent
+        ? "百分比可在工具的用量页查看（如 Kimi CLI 输入 /usage）；填入后按本机采集数据锚定估算总额与剩余，之后自动跟踪。"
+        : "用量按该 Agent 在当前周期内采集到的 Tokens 合计（含缓存）计算，百分比 = 已用 ÷ 配额。";
+    }
+    $("#plan-mode").addEventListener("change", togglePlanMode);
+    $("#plan-cards").addEventListener("click", async (e) => {
+      const btn = e.target.closest(".plan-del");
+      if (!btn) return;
+      const res = await fetch(`/api/plans?id=${btn.dataset.id}`, { method: "DELETE" });
+      if (res.ok) { toast("已删除配额"); renderPlans(); }
+    });
     $("#drawer-close").addEventListener("click", closeDrawer);
     $("#drawer-mask").addEventListener("click", closeDrawer);
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); } });
+
+    // 明细记录：时间粒度切换（按天 / 按小时 / 按分钟）
+    const recDate = $("#rec-date"), recHour = $("#rec-hour"), recHint = $("#rec-gran-hint");
+    recHour.innerHTML = Array.from({ length: 24 }, (_, h) =>
+      `<option value="${h}">${String(h).padStart(2, "0")} 时</option>`).join("");
+    state.recDate = localDateStr(new Date());
+    state.recHour = new Date().getHours();
+    recDate.value = state.recDate;
+    recHour.value = String(state.recHour);
+    $$("#rec-gran-seg button").forEach((b) => b.addEventListener("click", () => {
+      state.recGran = b.dataset.gran;
+      $$("#rec-gran-seg button").forEach((x) => x.classList.toggle("active", x === b));
+      recDate.hidden = state.recGran === "day";
+      recHour.hidden = state.recGran !== "minute";
+      recHint.hidden = state.recGran === "day";
+      render();
+    }));
+    recDate.addEventListener("change", () => {
+      state.recDate = recDate.value || localDateStr(new Date());
+      render();
+    });
+    recHour.addEventListener("change", () => { state.recHour = +recHour.value; render(); });
+
+    // 价格编辑弹窗 + 官方价格导入
+    const priceMask = $("#price-modal-mask");
+    const closePriceModal = () => priceMask.classList.remove("show");
+    $("#price-modal-close").addEventListener("click", closePriceModal);
+    priceMask.addEventListener("click", (e) => { if (e.target === priceMask) closePriceModal(); });
+    $("#price-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const payload = { model: f.model.value.trim(), input: +f.input.value, output: +f.output.value };
+      if (f.cache_read.value !== "") payload.cache_read = +f.cache_read.value;
+      const res = await fetch("/api/prices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        toast("价格已保存，费用已按新价重算");
+        closePriceModal();
+        await loadData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toast(err.error || "保存失败");
+      }
+    });
+    $("#btn-import-prices").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "⇓ 正在拉取 models.dev…";
+      try {
+        const res = await fetch("/api/prices/import", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) { toast(data.error || "导入失败"); return; }
+        const n = Object.keys(data.matched || {}).length;
+        const un = (data.unmatched || []).join("、");
+        toast(`已导入 ${n} 个模型的官方价格` + (un ? `；未匹配：${un}` : ""));
+        await loadData();
+      } catch (err) {
+        toast("导入失败：网络异常");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "⇓ 从 models.dev 导入官方价格";
+      }
+    });
+
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); closePlanModal(); closePriceModal(); } });
 
     const f = $("#add-form");
     f.addEventListener("submit", submitForm);
