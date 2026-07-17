@@ -8,7 +8,9 @@
     prices: {},
     agents: [],
     view: "overview",
-    range: 30,        // 0 = 全部
+    range: 30,        // 0 = 全部, "today" = 今天, "custom" = 自定义
+    customFrom: "",
+    customTo: "",
     agent: "all",
     model: "all",
     metric: "tokens", // tokens | cost
@@ -36,6 +38,9 @@
     return String(Math.round(n));
   }
   function fmtFull(n) { return Math.round(n).toLocaleString("en-US"); }
+  function localDateStr(d) {
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
   function fmtCost(c) {
     if (c >= 100) return "$" + c.toFixed(1);
     if (c >= 1) return "$" + c.toFixed(2);
@@ -68,10 +73,16 @@
 
   function filtered() {
     let list = state.records;
-    if (state.range > 0) {
+    if (state.range === "today") {
+      const t = localDateStr(new Date());
+      list = list.filter((r) => r.date === t);
+    } else if (state.range === "custom") {
+      if (state.customFrom) list = list.filter((r) => r.date >= state.customFrom);
+      if (state.customTo) list = list.filter((r) => r.date <= state.customTo);
+    } else if (state.range > 0) {
       const from = new Date();
       from.setDate(from.getDate() - state.range);
-      const fromStr = from.toISOString().slice(0, 10);
+      const fromStr = localDateStr(from);
       list = list.filter((r) => r.date >= fromStr);
     }
     if (state.agent !== "all") list = list.filter((r) => r.agent === state.agent);
@@ -99,7 +110,7 @@
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(today);
       d.setDate(d.getDate() - i);
-      dates.push(d.toISOString().slice(0, 10));
+      dates.push(localDateStr(d));
     }
     const map = {};
     for (const r of list) map[r.date] = (map[r.date] || 0) + totalTokens(r);
@@ -124,15 +135,31 @@
     textStyle: { color: "#e8ecf4", fontSize: 12 },
   };
 
-  function renderTrend(list) {
+  function rangeDates() {
+    const today = new Date();
+    if (state.range === "today") return [localDateStr(today)];
+    if (state.range === "custom" && state.customFrom && state.customTo) {
+      const dates = [];
+      const d = new Date(state.customFrom + "T00:00:00");
+      const end = new Date(state.customTo + "T00:00:00");
+      while (d <= end && dates.length < 370) {
+        dates.push(localDateStr(d));
+        d.setDate(d.getDate() + 1);
+      }
+      if (dates.length) return dates;
+    }
     const days = state.range === 7 ? 7 : 30;
     const dates = [];
-    const today = new Date();
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(today);
       d.setDate(d.getDate() - i);
-      dates.push(d.toISOString().slice(0, 10));
+      dates.push(localDateStr(d));
     }
+    return dates;
+  }
+
+  function renderTrend(list) {
+    const dates = rangeDates();
     const byModel = {};
     for (const r of list) {
       if (!byModel[r.model]) byModel[r.model] = {};
@@ -223,12 +250,14 @@
     const models = new Set(list.map((r) => r.model)).size;
     const agents = new Set(list.map((r) => r.agent)).size;
     const days = Math.max(1, new Set(list.map((r) => r.date)).size);
+    const hitRate = input + cached > 0 ? (cached / (input + cached)) * 100 : 0;
 
     const cards = [
       { label: "总消耗 Tokens", value: fmtNum(tokens), sub: `输入 ${fmtNum(input)} · 输出 ${fmtNum(output)} · 缓存 ${fmtNum(cached)}`, color: "rgba(124,92,255,0.3)" },
       { label: "总费用（估算）", value: fmtCost(cost), sub: `日均 ${fmtCost(cost / days)}`, color: "rgba(0,212,255,0.28)" },
       { label: "总请求数", value: fmtFull(requests), sub: `日均 ${fmtFull(Math.round(requests / days))} 次`, color: "rgba(52,211,153,0.28)" },
       { label: "活跃模型 / Agent", value: `${models} <small>/</small> ${agents}`, sub: `${days} 天有使用记录`, color: "rgba(251,191,36,0.26)" },
+      { label: "缓存命中率", value: hitRate.toFixed(1) + "%", sub: `缓存 ${fmtNum(cached)} / 总输入 ${fmtNum(input + cached)}`, color: "rgba(45,212,191,0.28)" },
     ];
     $("#stat-cards").innerHTML = cards.map((c) => `
       <div class="stat-card" style="--sc:${c.color}">
@@ -312,6 +341,11 @@
   }
 
   /* ---------- 渲染：记录表 ---------- */
+  function hitRate(r) {
+    const total = r.input + r.cached;
+    return total > 0 ? ((r.cached / total) * 100).toFixed(1) + "%" : "—";
+  }
+
   function renderRecords(list) {
     const rows = [...list].sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
     $("#records-count").textContent = `共 ${rows.length} 条`;
@@ -324,10 +358,11 @@
         <td class="num">${fmtFull(r.input)}</td>
         <td class="num">${fmtFull(r.output)}</td>
         <td class="num">${fmtFull(r.cached)}</td>
+        <td class="num">${hitRate(r)}</td>
         <td class="num"><b>${fmtFull(totalTokens(r))}</b></td>
         <td class="num">${fmtCost(r.cost)}</td>
         <td class="num">${r.source === "auto" ? '<span class="auto-badge">自动</span>' : `<button class="row-del" data-id="${r.id}" title="删除">✕</button>`}</td>
-      </tr>`).join("") || `<tr><td colspan="10" class="empty">暂无数据：点击左下「同步本地数据」扫描本机 AI 工具日志，或「录入数据」手动添加</td></tr>`;
+      </tr>`).join("") || `<tr><td colspan="11" class="empty">暂无数据：点击左下「同步本地数据」扫描本机 AI 工具日志，或「录入数据」手动添加</td></tr>`;
 
     $$("#records-tbody .row-del").forEach((btn) => btn.addEventListener("click", async (e) => {
       e.stopPropagation();
@@ -529,10 +564,26 @@
     $$(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
 
     $$("#range-seg button").forEach((b) => b.addEventListener("click", () => {
-      state.range = +b.dataset.range;
+      const v = b.dataset.range;
+      state.range = v === "today" || v === "custom" ? v : +v;
       $$("#range-seg button").forEach((x) => x.classList.toggle("active", x === b));
+      $("#custom-range").hidden = state.range !== "custom";
+      if (state.range === "custom") {
+        const today = localDateStr(new Date());
+        if (!$("#date-to").value) $("#date-to").value = today;
+        if (!$("#date-from").value) {
+          const d = new Date();
+          d.setDate(d.getDate() - 6);
+          $("#date-from").value = localDateStr(d);
+        }
+        state.customFrom = $("#date-from").value;
+        state.customTo = $("#date-to").value;
+      }
       render();
     }));
+
+    $("#date-from").addEventListener("change", (e) => { state.customFrom = e.target.value; render(); });
+    $("#date-to").addEventListener("change", (e) => { state.customTo = e.target.value; render(); });
 
     $$("#metric-seg button").forEach((b) => b.addEventListener("click", () => {
       state.metric = b.dataset.metric;
@@ -545,6 +596,24 @@
 
     $("#btn-add").addEventListener("click", openModal);
     $("#btn-sync").addEventListener("click", syncData);
+
+    // 自动同步：每 2 分钟静默采集一次并刷新（后台本来也有 10 分钟扫描，这里让页面数据更及时）
+    let autoSyncTimer = null;
+    $("#chk-auto-sync").addEventListener("change", (e) => {
+      clearInterval(autoSyncTimer);
+      autoSyncTimer = null;
+      if (e.target.checked) {
+        autoSyncTimer = setInterval(async () => {
+          try {
+            await fetch("/api/collect", { method: "POST" });
+            await loadData();
+          } catch (err) { /* 静默失败，下轮再试 */ }
+        }, 120000);
+        toast("已开启自动同步（每 2 分钟）");
+      } else {
+        toast("已关闭自动同步");
+      }
+    });
     $("#modal-close").addEventListener("click", closeModal);
     $("#modal-mask").addEventListener("click", (e) => { if (e.target.id === "modal-mask") closeModal(); });
     $("#drawer-close").addEventListener("click", closeDrawer);

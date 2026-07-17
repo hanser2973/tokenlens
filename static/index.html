@@ -36,6 +36,7 @@
     <div class="sidebar-foot">
       <button class="btn-ghost" id="btn-sync">⟳ 同步本地数据</button>
       <button class="btn-primary" id="btn-add">＋ 录入数据</button>
+      <label class="auto-sync"><input type="checkbox" id="chk-auto-sync"> 自动同步（每 2 分钟）</label>
       <div class="foot-tip" id="foot-tip"></div>
     </div>
   </aside>
@@ -46,9 +47,16 @@
       <div class="page-title" id="page-title">总览</div>
       <div class="filters">
         <div class="seg" id="range-seg">
+          <button data-range="today">今天</button>
           <button data-range="7">近 7 天</button>
           <button data-range="30" class="active">近 30 天</button>
           <button data-range="0">全部</button>
+          <button data-range="custom">自定义</button>
+        </div>
+        <div class="custom-range" id="custom-range" hidden>
+          <input type="date" id="date-from">
+          <span class="cr-sep">至</span>
+          <input type="date" id="date-to">
         </div>
         <select id="filter-agent" class="select"><option value="all">全部 Agent</option></select>
         <select id="filter-model" class="select"><option value="all">全部模型</option></select>
@@ -116,6 +124,7 @@
                 <th>日期</th><th>Agent</th><th>模型</th>
                 <th class="num">请求数</th><th class="num">输入</th>
                 <th class="num">输出</th><th class="num">缓存</th>
+                <th class="num">缓存命中率</th>
                 <th class="num">合计</th><th class="num">费用</th><th></th>
               </tr>
             </thead>
