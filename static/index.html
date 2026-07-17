@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokenLens · AI / Agent Token 消耗统计</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/echarts.min.js"></script>
+</head>
+<body>
+<div class="app">
+
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">◈</div>
+      <div>
+        <div class="logo-name">TokenLens</div>
+        <div class="logo-sub">AI Token 消耗看板</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview">
+        <span class="nav-ico">▦</span> 总览
+      </button>
+      <button class="nav-item" data-view="models">
+        <span class="nav-ico">◉</span> 模型
+      </button>
+      <button class="nav-item" data-view="agents">
+        <span class="nav-ico">⬡</span> Agent
+      </button>
+      <button class="nav-item" data-view="records">
+        <span class="nav-ico">☰</span> 明细记录
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <button class="btn-ghost" id="btn-sync">⟳ 同步本地数据</button>
+      <button class="btn-primary" id="btn-add">＋ 录入数据</button>
+      <div class="foot-tip" id="foot-tip"></div>
+    </div>
+  </aside>
+
+  <!-- 主区域 -->
+  <main class="main">
+    <header class="topbar">
+      <div class="page-title" id="page-title">总览</div>
+      <div class="filters">
+        <div class="seg" id="range-seg">
+          <button data-range="7">近 7 天</button>
+          <button data-range="30" class="active">近 30 天</button>
+          <button data-range="0">全部</button>
+        </div>
+        <select id="filter-agent" class="select"><option value="all">全部 Agent</option></select>
+        <select id="filter-model" class="select"><option value="all">全部模型</option></select>
+      </div>
+    </header>
+
+    <!-- 总览 -->
+    <section id="view-overview" class="view active">
+      <div class="stat-grid" id="stat-cards"></div>
+      <div class="grid-1">
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">消耗趋势</div>
+            <div class="seg small" id="metric-seg">
+              <button data-metric="tokens" class="active">Tokens</button>
+              <button data-metric="cost">费用</button>
+            </div>
+          </div>
+          <div class="chart tall" id="chart-trend"></div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><div class="card-title">模型 Token 占比</div></div>
+          <div class="chart" id="chart-model-pie"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title">Agent Token 构成</div></div>
+          <div class="chart" id="chart-agent-bar"></div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><div class="card-title">模型排行</div><span class="card-hint">点击查看详情</span></div>
+          <div id="model-rank" class="rank-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title">Agent 排行</div><span class="card-hint">点击查看详情</span></div>
+          <div id="agent-rank" class="rank-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 模型 -->
+    <section id="view-models" class="view">
+      <div class="entity-grid" id="model-cards"></div>
+    </section>
+
+    <!-- Agent -->
+    <section id="view-agents" class="view">
+      <div class="entity-grid" id="agent-cards"></div>
+    </section>
+
+    <!-- 明细记录 -->
+    <section id="view-records" class="view">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">全部记录</div>
+          <span class="card-hint" id="records-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>日期</th><th>Agent</th><th>模型</th>
+                <th class="num">请求数</th><th class="num">输入</th>
+                <th class="num">输出</th><th class="num">缓存</th>
+                <th class="num">合计</th><th class="num">费用</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="records-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 详情抽屉 -->
+<div class="drawer-mask" id="drawer-mask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-tag" id="drawer-tag"></div>
+      <div class="drawer-title" id="drawer-title"></div>
+    </div>
+    <button class="icon-btn" id="drawer-close">✕</button>
+  </div>
+  <div class="drawer-stats" id="drawer-stats"></div>
+  <div class="card flat">
+    <div class="card-head"><div class="card-title">近 30 天趋势</div></div>
+    <div class="chart" id="chart-drawer"></div>
+  </div>
+  <div class="card flat">
+    <div class="card-head"><div class="card-title">相关记录</div><span class="card-hint">最近 20 条</span></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>日期</th><th id="drawer-col-extra">Agent</th><th class="num">Tokens</th><th class="num">费用</th></tr></thead>
+        <tbody id="drawer-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</aside>
+
+<!-- 录入弹窗 -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">录入消耗数据</div>
+      <button class="icon-btn" id="modal-close">✕</button>
+    </div>
+    <form id="add-form" class="form">
+      <div class="form-row">
+        <label>日期</label>
+        <input type="date" name="date" required>
+      </div>
+      <div class="form-row">
+        <label>Agent</label>
+        <input type="text" name="agent" list="dl-agents" placeholder="如 Kimi Code" required>
+        <datalist id="dl-agents"></datalist>
+      </div>
+      <div class="form-row">
+        <label>模型</label>
+        <input type="text" name="model" list="dl-models" placeholder="如 Kimi K2" required>
+        <datalist id="dl-models"></datalist>
+      </div>
+      <div class="form-grid">
+        <div class="form-row"><label>请求数</label><input type="number" name="requests" min="0" value="1"></div>
+        <div class="form-row"><label>输入 Tokens</label><input type="number" name="input" min="0" value="0"></div>
+        <div class="form-row"><label>输出 Tokens</label><input type="number" name="output" min="0" value="0"></div>
+        <div class="form-row"><label>缓存 Tokens</label><input type="number" name="cached" min="0" value="0"></div>
+      </div>
+      <div class="form-row">
+        <label>费用（美元，留空自动按价目估算）</label>
+        <input type="number" name="cost" min="0" step="0.0001" placeholder="自动估算">
+      </div>
+      <div class="form-tip" id="cost-tip"></div>
+      <button type="submit" class="btn-primary wide">保存记录</button>
+    </form>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
