@@ -12,13 +12,14 @@ import socket
 import sys
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 import collector
 import quota
+import storage
 from pricing import load_prices, calc_cost, save_user_price
 
 if getattr(sys, "frozen", False):
@@ -29,9 +30,10 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_DIR = os.path.join(BASE_DIR, "data")
+STATIC_PREFIX = os.path.normcase(STATIC_DIR) + os.sep  # 静态文件防目录穿越的比较前缀
 DATA_FILE = os.path.join(DATA_DIR, "records.json")
 PLANS_FILE = os.path.join(DATA_DIR, "plans.json")
-CAL_FILE = os.path.join(DATA_DIR, "quota_cal.json")  # 跨设备配额校准值（随 git 同步）
+CAL_FILE = os.path.join(DATA_DIR, "quota_cal.json")  # 跨设备配额校准值（本地保存，勿公开提交）
 COLLECT_INTERVAL = 600  # 每 10 分钟自动扫描一次本地日志
 
 # 手动配额的周期定义：标签 + 周期秒数（按滚动窗口统计）
@@ -52,17 +54,12 @@ def load_records():
         if not os.path.exists(DATA_FILE):
             save_records([])
             return []
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except ValueError:
-            return []
+        data = storage.load_json(DATA_FILE, [])
+        return data if isinstance(data, list) else []
 
 
 def save_records(records):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=1)
+    storage.save_json(DATA_FILE, records, indent=1)
 
 
 def seed_demo_data():
@@ -323,18 +320,12 @@ def import_models_dev(data_dir=None):
 # ---------- Plan（套餐配额）用量 ----------
 
 def load_plans():
-    try:
-        with open(PLANS_FILE, "r", encoding="utf-8") as f:
-            plans = json.load(f)
-        return plans if isinstance(plans, list) else []
-    except (OSError, ValueError):
-        return []
+    plans = storage.load_json(PLANS_FILE, [])
+    return plans if isinstance(plans, list) else []
 
 
 def save_plans(plans):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PLANS_FILE, "w", encoding="utf-8") as f:
-        json.dump(plans, f, ensure_ascii=False, indent=1)
+    storage.save_json(PLANS_FILE, plans, indent=1)
 
 
 def _window_label(minutes):
@@ -350,23 +341,17 @@ def _window_label(minutes):
 def _period_used(records, agent, span):
     """某 Agent 在当前滚动周期内采集到的 tokens 合计（含缓存，按天粒度）。"""
     from_day = (date.today() - timedelta(days=max(0, -(-span // 86400)) - 1)).isoformat()
-    return sum(r["input"] + r["output"] + r["cached"]
+    return sum(r.get("input", 0) + r.get("output", 0) + r.get("cached", 0)
                for r in records if r.get("agent") == agent and r.get("date", "") >= from_day)
 
 
 def _load_cal():
-    try:
-        with open(CAL_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    d = storage.load_json(CAL_FILE, {})
+    return d if isinstance(d, dict) else {}
 
 
 def _save_cal(d):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CAL_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=1)
+    storage.save_json(CAL_FILE, d, indent=1)
 
 
 def _calibrated_quota(agent_kind, window):
@@ -500,9 +485,52 @@ def compute_plans():
     return result
 
 
+# 仅服务本机请求：Host 必须是本机地址；写操作额外要求 Origin（如有）也是本机
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+MAX_BODY = 1 << 20  # JSON 请求体上限 1 MB
+
+
+def _host_name(value):
+    """从 Host 头取主机名（去端口、去 IPv6 方括号）。"""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.split(":", 1)[0]
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 静音访问日志
         pass
+
+    def _host_ok(self, writes=False):
+        """Host 校验（防 DNS rebinding 读数据）；写操作再校验 Origin（挡跨站表单 CSRF）。"""
+        if _host_name(self.headers.get("Host")) not in LOCAL_HOSTS:
+            return False
+        if writes:
+            origin = self.headers.get("Origin")
+            if origin and (urlparse(origin).hostname or "").lower() not in LOCAL_HOSTS:
+                return False
+        return True
+
+    def _read_json(self):
+        """读取 JSON 请求体；成功返回 dict，失败返回 None 并已发送 4xx 响应。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._send_json({"error": "invalid Content-Length"}, 400)
+        elif length > MAX_BODY:
+            self._send_json({"error": "请求体过大"}, 413)
+        else:
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+            self._send_json({"error": "invalid json"}, 400)
+        return None
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -528,6 +556,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._host_ok():
+            self._send_json({"error": "forbidden"}, 403)
+            return
         url = urlparse(self.path)
         path = url.path
         if path == "/":
@@ -564,7 +595,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/static/"):
             rel = path[len("/static/"):]
             full = os.path.normpath(os.path.join(STATIC_DIR, rel))
-            if not full.startswith(STATIC_DIR):
+            if not os.path.normcase(full).startswith(STATIC_PREFIX):
                 self._send_json({"error": "forbidden"}, 403)
                 return
             self._send_file(full)
@@ -572,6 +603,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._host_ok(writes=True):
+            self._send_json({"error": "forbidden"}, 403)
+            return
         url = urlparse(self.path)
         if url.path == "/api/collect":
             try:
@@ -590,11 +624,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **result})
             return
         if url.path == "/api/prices":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            except Exception:
-                self._send_json({"error": "invalid json"}, 400)
+            payload = self._read_json()
+            if payload is None:
                 return
             model = str(payload.get("model", "")).strip()
             if not model:
@@ -619,11 +650,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "model": model.lower(), "price": entry})
             return
         if url.path == "/api/plans":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            except Exception:
-                self._send_json({"error": "invalid json"}, 400)
+            payload = self._read_json()
+            if payload is None:
                 return
             agent = str(payload.get("agent", "")).strip()
             period = str(payload.get("period", "")).strip()
@@ -670,16 +698,19 @@ class Handler(BaseHTTPRequestHandler):
         if url.path != "/api/records":
             self._send_json({"error": "not found"}, 404)
             return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except Exception:
-            self._send_json({"error": "invalid json"}, 400)
+        payload = self._read_json()
+        if payload is None:
             return
 
         required = ["date", "agent", "model"]
         if any(not str(payload.get(k, "")).strip() for k in required):
             self._send_json({"error": "date/agent/model 不能为空"}, 400)
+            return
+        day = str(payload["date"]).strip()
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            self._send_json({"error": "date 格式需为 YYYY-MM-DD"}, 400)
             return
 
         def to_int(v):
@@ -702,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
 
         rec = {
             "id": new_id,
-            "date": str(payload["date"]).strip(),
+            "date": day,
             "agent": str(payload["agent"]).strip(),
             "model": model,
             "requests": to_int(payload.get("requests")) or 1,
@@ -718,6 +749,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "record": rec})
 
     def do_DELETE(self):
+        if not self._host_ok(writes=True):
+            self._send_json({"error": "forbidden"}, 403)
+            return
         url = urlparse(self.path)
         if url.path == "/api/plans":
             qs = parse_qs(url.query)

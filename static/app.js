@@ -360,7 +360,7 @@
     $("#records-count").textContent = `共 ${rows.length} 条`;
     $("#records-tbody").innerHTML = rows.map((r) => `
       <tr>
-        <td>${r.date}</td>
+        <td>${esc(r.date)}</td>
         <td><span class="tag"><i style="background:${colorOf(r.agent)}"></i>${esc(r.agent)}</span></td>
         <td><span class="tag"><i style="background:${colorOf(r.model)}"></i>${esc(r.model)}</span></td>
         <td class="num">${fmtFull(r.requests)}</td>
@@ -475,7 +475,7 @@
     const rows = [...list].sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id).slice(0, 20);
     $("#drawer-tbody").innerHTML = rows.map((r) => `
       <tr>
-        <td>${r.date}</td>
+        <td>${esc(r.date)}</td>
         <td><span class="tag"><i style="background:${colorOf(r[extraKey])}"></i>${esc(r[extraKey])}</span></td>
         <td class="num">${fmtFull(totalTokens(r))}</td>
         <td class="num">${fmtCost(r.cost)}</td>

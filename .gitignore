@@ -3,3 +3,8 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# 本机使用数据（含绝对路径等隐私），切勿提交
+data/
+# 打包产物走 Releases，不入库
+TokenLens.exe

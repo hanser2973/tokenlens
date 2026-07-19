@@ -9,6 +9,7 @@
 """
 import json
 import os
+import storage
 
 # 默认价格（美元 / 百万 tokens），键必须小写
 MODEL_PRICES = {
@@ -75,9 +76,7 @@ def save_user_price(data_dir, model, entry):
         except (OSError, ValueError):
             data = {}
     data[str(model).lower()] = entry
-    os.makedirs(data_dir, exist_ok=True)
-    with open(user_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+    storage.save_json(user_file, data, indent=1)
 
 
 def calc_cost(prices, model, input_tokens, output_tokens, cached_tokens):

@@ -15,6 +15,7 @@
 import glob
 import json
 import os
+import storage
 from datetime import datetime
 
 STATE_FILE = "collector_state.json"
@@ -249,17 +250,11 @@ def latest_rate_limits(max_files=15, tail=1 << 20):
 # ---------- 存储 ----------
 
 def _load_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default
+    return storage.load_json(path, default)
 
 
 def _save_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
+    storage.save_json(path, obj)
 
 
 # ---------- 主流程 ----------

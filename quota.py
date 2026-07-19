@@ -45,6 +45,7 @@ def _save_cred(cred):
     tmp = CRED_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cred, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)  # POSIX 下避免 OAuth 凭证被其他用户读取
     os.replace(tmp, CRED_FILE)
 
 
