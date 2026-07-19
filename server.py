@@ -210,51 +210,50 @@ def get_catalog_index(data_dir, force=False):
     return index
 
 
-def import_models_dev():
-    """从 models.dev 拉取价格目录，按当前记录里的模型匹配并写入 data/prices.json。"""
-    import urllib.request
-    req = urllib.request.Request(MODELS_DEV_URL, headers={"User-Agent": "Mozilla/5.0 (TokenLens)"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        catalog = json.loads(resp.read().decode("utf-8"))
-    # 目录索引：小写模型 id → 按优先级排序的 (provider, cost) 列表
-    index = {}
-    providers = sorted(catalog, key=lambda p: (PREFERRED_PROVIDERS.index(p)
-                                               if p in PREFERRED_PROVIDERS else 99, p))
-    for prov in providers:
-        models = (catalog.get(prov) or {}).get("models") or {}
-        for mid, m in models.items():
-            cost = m.get("cost") or {}
-            try:
-                entry = {"input": float(cost.get("input") or 0), "output": float(cost.get("output") or 0)}
-            except (TypeError, ValueError):
-                continue
-            if entry["input"] <= 0 and entry["output"] <= 0:
-                continue  # 跳过订阅制 0 价条目
-            if cost.get("cache_read") is not None:
-                try:
-                    entry["cache_read"] = float(cost["cache_read"])
-                except (TypeError, ValueError):
-                    pass
-            short = mid.rsplit("/", 1)[-1].lower()
-            index.setdefault(short, []).append((prov, entry))
+def match_model(index, model):
+    """按 别名 → 精确 → 子串（取最短 id）匹配目录，返回价格 entry 或 None。"""
+    target = MODEL_ALIASES.get(model, model)
+    entry = index.get(target)
+    if entry:
+        return entry
+    subs = [mid for mid in index if target in mid or mid in target]
+    if subs:
+        return index[min(subs, key=len)]
+    return None
 
+
+def unpriced_models(records, prices):
+    """记录中出现过、但价格表里没有的模型（小写，排序）。"""
+    return sorted({str(r.get("model", "")).lower() for r in records if r.get("model")}
+                  - set(prices))
+
+
+def maybe_auto_match(data_dir, records, prices):
+    """占位：Task 3 实现自动匹配逻辑。"""
+    return None
+
+
+def import_models_dev(data_dir=None):
+    """强制刷新 models.dev 目录，按当前记录里的模型匹配并写入 prices.json（覆盖同名）。
+
+    手动导入是显式操作：强制刷新目录缓存、覆盖匹配到的已有价格，
+    并把未匹配模型写入缓存 unmatched（目录刷新前自动匹配不再重试）。
+    """
+    data_dir = data_dir or DATA_DIR
+    index = get_catalog_index(data_dir, force=True)
     records, _ = merged_records()
     our_models = sorted({str(r.get("model", "")).lower() for r in records if r.get("model")})
     matched, unmatched = {}, []
     for model in our_models:
-        target = MODEL_ALIASES.get(model, model)
-        candidates = index.get(target)
-        if not candidates:
-            # 子串匹配：目录 id 包含目标或目标包含目录 id，取最短 id
-            subs = [mid for mid in index if target in mid or mid in target]
-            if subs:
-                candidates = index[min(subs, key=len)]
-        if candidates:
-            matched[model] = candidates[0][1]
+        entry = match_model(index, model)
+        if entry:
+            matched[model] = entry
         else:
             unmatched.append(model)
     for model, entry in matched.items():
-        save_user_price(DATA_DIR, model, entry)
+        with _lock:
+            save_user_price(data_dir, model, entry)
+    _write_catalog_cache(data_dir, index, {m: int(time.time()) for m in unmatched})
     return {"matched": matched, "unmatched": unmatched}
 
 
@@ -497,8 +496,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/prices":
             prices = load_prices(DATA_DIR)
             records, _ = merged_records()
-            used = sorted({str(r.get("model", "")).lower() for r in records if r.get("model")})
-            self._send_json({"prices": prices, "unpriced": [m for m in used if m not in prices]})
+            self._send_json({"prices": prices, "unpriced": unpriced_models(records, prices)})
         elif path.startswith("/static/"):
             rel = path[len("/static/"):]
             full = os.path.normpath(os.path.join(STATIC_DIR, rel))

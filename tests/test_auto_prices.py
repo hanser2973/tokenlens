@@ -107,5 +107,78 @@ class CatalogCacheTest(unittest.TestCase):
         self.assertEqual(fetch.call_count, 1)
 
 
+class MatchModelTest(unittest.TestCase):
+    def test_alias(self):
+        index = {"kimi-k2.7-code": {"input": 0.95, "output": 4.0}}
+        self.assertEqual(server.match_model(index, "k2p7"), {"input": 0.95, "output": 4.0})
+
+    def test_exact(self):
+        index = {"gpt-5.2": {"input": 1.75, "output": 14.0}}
+        self.assertEqual(server.match_model(index, "gpt-5.2"), {"input": 1.75, "output": 14.0})
+
+    def test_substring_picks_shortest(self):
+        index = {"gpt-5.2-mini": {"input": 0.4, "output": 1.6},
+                 "gpt-5.2-mini-2026": {"input": 0.5, "output": 2.0}}
+        self.assertEqual(server.match_model(index, "gpt-5.2"), {"input": 0.4, "output": 1.6})
+
+    def test_no_match(self):
+        self.assertIsNone(server.match_model({"a": {"input": 1, "output": 1}}, "zzz"))
+
+
+class UnpricedModelsTest(unittest.TestCase):
+    def test_unpriced(self):
+        records = [{"model": "Kimi K2"}, {"model": "New Thing"}, {"model": ""}]
+        prices = {"kimi k2": {"input": 0.6, "output": 2.5}}
+        self.assertEqual(server.unpriced_models(records, prices), ["new thing"])
+
+
+class ImportModelsDevTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._patchers = [
+            mock.patch.object(server, "DATA_DIR", self.tmp),
+            mock.patch.object(server, "DATA_FILE", os.path.join(self.tmp, "records.json")),
+            # 隔离自动匹配后台线程，保证测试确定性（Task 3 实现，此处防御性 patch）
+            mock.patch.object(server, "maybe_auto_match", lambda *a, **k: None),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+
+    def _write_records(self, models):
+        with open(server.DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump([{"id": i + 1, "date": "2026-07-19", "agent": "A", "model": m,
+                        "requests": 1, "input": 1, "output": 1, "cached": 0, "cost": 0}
+                       for i, m in enumerate(models)], f)
+
+    def _read_prices(self):
+        with open(os.path.join(self.tmp, "prices.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_import_matches_and_writes(self):
+        self._write_records(["Kimi K2", "Unknown XYZ"])
+        with mock.patch.object(server, "_fetch_catalog_json", return_value=CATALOG):
+            result = server.import_models_dev()
+        self.assertIn("kimi k2", result["matched"])
+        self.assertEqual(result["unmatched"], ["unknown xyz"])
+        self.assertEqual(self._read_prices()["kimi k2"], {"input": 0.6, "output": 2.5})
+        # 手动导入应刷新目录缓存，并把未匹配模型写入缓存 unmatched
+        cache = server._read_catalog_cache(self.tmp)
+        self.assertIsNotNone(cache)
+        self.assertIn("unknown xyz", cache["unmatched"])
+
+    def test_import_overwrites_existing(self):
+        """手动点导入是显式操作，保持现有覆盖行为（与自动匹配'只补缺失'不同）。"""
+        self._write_records(["Kimi K2"])
+        with open(os.path.join(self.tmp, "prices.json"), "w", encoding="utf-8") as f:
+            json.dump({"kimi k2": {"input": 99.0, "output": 99.0}}, f)
+        with mock.patch.object(server, "_fetch_catalog_json", return_value=CATALOG):
+            server.import_models_dev()
+        self.assertEqual(self._read_prices()["kimi k2"]["input"], 0.6)
+
+
 if __name__ == "__main__":
     unittest.main()
