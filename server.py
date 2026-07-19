@@ -15,6 +15,7 @@ import time
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+import urllib.request
 
 import collector
 import quota
@@ -130,6 +131,79 @@ MODEL_ALIASES = {
 # 目录提供方优先级（越靠前越官方）
 PREFERRED_PROVIDERS = ["moonshotai", "moonshotai-cn", "zhipu", "deepseek", "openai",
                        "anthropic", "google", "qwen", "volcengine", "minimax", "kimi-for-coding"]
+
+CATALOG_TTL = 24 * 3600  # models.dev 目录缓存 24 小时
+
+
+def _fetch_catalog_json():
+    req = urllib.request.Request(MODELS_DEV_URL, headers={"User-Agent": "Mozilla/5.0 (TokenLens)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def build_catalog_index(catalog):
+    """把 models.dev 目录构建成 小写模型id → 价格 的索引（provider 按优先级去重）。"""
+    index = {}
+    providers = sorted(catalog, key=lambda p: (PREFERRED_PROVIDERS.index(p)
+                                               if p in PREFERRED_PROVIDERS else 99, p))
+    for prov in providers:
+        models = (catalog.get(prov) or {}).get("models") or {}
+        for mid, m in models.items():
+            cost = m.get("cost") or {}
+            try:
+                entry = {"input": float(cost.get("input") or 0), "output": float(cost.get("output") or 0)}
+            except (TypeError, ValueError):
+                continue
+            if entry["input"] <= 0 and entry["output"] <= 0:
+                continue  # 跳过订阅制 0 价条目
+            if cost.get("cache_read") is not None:
+                try:
+                    entry["cache_read"] = float(cost["cache_read"])
+                except (TypeError, ValueError):
+                    pass
+            short = mid.rsplit("/", 1)[-1].lower()
+            index.setdefault(short, entry)  # providers 已按优先级排序，先到先得
+    return index
+
+
+def _catalog_cache_file(data_dir):
+    return os.path.join(data_dir, "models_dev_cache.json")
+
+
+def _read_catalog_cache(data_dir):
+    try:
+        with open(_catalog_cache_file(data_dir), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("index"), dict):
+            d.setdefault("unmatched", {})
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_catalog_cache(data_dir, index, unmatched):
+    os.makedirs(data_dir, exist_ok=True)
+    with open(_catalog_cache_file(data_dir), "w", encoding="utf-8") as f:
+        json.dump({"fetched_at": int(time.time()), "index": index,
+                   "unmatched": unmatched}, f, ensure_ascii=False)
+
+
+def get_catalog_index(data_dir, force=False):
+    """返回 models.dev 目录索引。缓存 24h 内复用；force 强制刷新。
+    网络失败时回退到过期缓存；连缓存都没有则抛异常。成功刷新会清空 unmatched。"""
+    cache = _read_catalog_cache(data_dir)
+    fresh = cache and (time.time() - float(cache.get("fetched_at") or 0) < CATALOG_TTL)
+    if cache and fresh and not force:
+        return cache["index"]
+    try:
+        index = build_catalog_index(_fetch_catalog_json())
+    except Exception:
+        if cache:
+            return cache["index"]  # 离线时用旧缓存
+        raise
+    _write_catalog_cache(data_dir, index, {})
+    return index
 
 
 def import_models_dev():
