@@ -6,6 +6,7 @@
   const state = {
     records: [],
     prices: {},
+    unpriced: [],
     agents: [],
     view: "overview",
     range: 30,        // 0 = 全部, "today" = 今天, "custom" = 自定义
@@ -69,6 +70,7 @@
     const data = await res.json();
     state.records = data.records;
     state.prices = data.prices;
+    state.unpriced = data.unpriced || [];
     state.agents = data.agents;
     buildFilterOptions();
     render();
@@ -304,6 +306,7 @@
             <div class="entity-name">${esc(m.name)}</div>
             <div class="entity-sub">${m.days} 天活跃 · 占比 ${share}%</div>
           </div>
+          ${type === "model" && state.unpriced.includes(String(m.name).toLowerCase()) ? `<span class="price-badge">未定价</span>` : ""}
           ${type === "model" ? `<button class="icon-btn price-edit" data-name="${esc(m.name)}" title="编辑价格">✎</button>` : ""}
         </div>
         <div class="entity-stats">
@@ -597,6 +600,13 @@
     }), 30);
   }
 
+  function renderModelsHint() {
+    const n = state.unpriced.length;
+    $("#models-hint").textContent =
+      "订阅制模型按官方 API 参考价估算，不代表真实扣费；点卡片上的 ✎ 可改价"
+      + (n ? ` · ${n} 个模型未定价，点 ✎ 设置` : "");
+  }
+
   function render() {
     const list = filtered();
     const autoCount = state.records.filter((r) => r.source === "auto").length;
@@ -608,6 +618,7 @@
       renderAgentBar(list);
       renderRanks(list);
     } else if (state.view === "models") {
+      renderModelsHint();
       renderEntityCards(list, "model", "#model-cards", "model");
     } else if (state.view === "agents") {
       renderEntityCards(list, "agent", "#agent-cards", "agent");
