@@ -87,6 +87,25 @@ class CatalogCacheTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 server.get_catalog_index(self.tmp)
 
+    def test_corrupt_cache_returns_none(self):
+        with open(self._cache_path(), "w", encoding="utf-8") as f:
+            f.write("{ not valid json")
+        self.assertIsNone(server._read_catalog_cache(self.tmp))
+
+    def test_bad_fetched_at_treated_as_stale(self):
+        with self._fetch_ok() as fetch:
+            server.get_catalog_index(self.tmp)
+        with open(self._cache_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        d["fetched_at"] = "not-a-number"
+        with open(self._cache_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        # fetched_at 非数字 → 按过期处理，重新拉取且不抛异常
+        with self._fetch_ok() as fetch:
+            index = server.get_catalog_index(self.tmp)
+        self.assertEqual(index["kimi-k3"]["input"], 3.0)
+        self.assertEqual(fetch.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

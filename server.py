@@ -193,7 +193,11 @@ def get_catalog_index(data_dir, force=False):
     """返回 models.dev 目录索引。缓存 24h 内复用；force 强制刷新。
     网络失败时回退到过期缓存；连缓存都没有则抛异常。成功刷新会清空 unmatched。"""
     cache = _read_catalog_cache(data_dir)
-    fresh = cache and (time.time() - float(cache.get("fetched_at") or 0) < CATALOG_TTL)
+    try:
+        fetched_at = float(cache.get("fetched_at") or 0) if cache else 0
+    except (TypeError, ValueError):
+        fetched_at = 0  # 非数字按过期处理
+    fresh = cache and (time.time() - fetched_at < CATALOG_TTL)
     if cache and fresh and not force:
         return cache["index"]
     try:
