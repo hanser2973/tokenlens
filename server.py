@@ -114,7 +114,9 @@ def merged_records():
     for r in manual:
         r.setdefault("source", "manual")
     auto = collector.load_auto_records(DATA_DIR, prices, calc_cost)
-    return manual + auto, prices
+    records = manual + auto
+    maybe_auto_match(DATA_DIR, records, prices)  # 发现新模型时后台自动补价
+    return records, prices
 
 
 # ---------- 价格表（models.dev 导入） ----------
@@ -183,10 +185,14 @@ def _read_catalog_cache(data_dir):
 
 
 def _write_catalog_cache(data_dir, index, unmatched):
+    """原子写入缓存（唯一临时文件 + os.replace），并发读写不会看到写了一半的文件。"""
     os.makedirs(data_dir, exist_ok=True)
-    with open(_catalog_cache_file(data_dir), "w", encoding="utf-8") as f:
+    target = _catalog_cache_file(data_dir)
+    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"fetched_at": int(time.time()), "index": index,
                    "unmatched": unmatched}, f, ensure_ascii=False)
+    os.replace(tmp, target)
 
 
 def get_catalog_index(data_dir, force=False):
@@ -228,9 +234,66 @@ def unpriced_models(records, prices):
                   - set(prices))
 
 
+AUTO_MATCH_MIN_INTERVAL = 300  # 自动匹配最小间隔秒数（失败时避免频繁重试）
+_auto_match_lock = threading.Lock()
+_auto_match_last_try = 0
+
+
+def auto_match_prices(data_dir, models):
+    """给无价格模型自动匹配目录价格。只补缺失，不覆盖已有价格；失败静默。"""
+    cache = _read_catalog_cache(data_dir)
+    unmatched = dict((cache or {}).get("unmatched") or {})
+    todo = [m for m in models if m not in unmatched]
+    if not todo:
+        return
+    try:
+        index = get_catalog_index(data_dir)
+    except Exception:
+        return  # 离线等失败：静默跳过，下次检测到再试
+    prices = load_prices(data_dir)
+    for model in todo:
+        if model in prices:
+            continue  # 只补缺失（含默认价格表里的模型）
+        entry = match_model(index, model)
+        if entry:
+            with _lock:
+                save_user_price(data_dir, model, entry)
+        else:
+            unmatched[model] = int(time.time())
+    # 把新出现的未匹配模型写回缓存（目录未刷新前不再重试）
+    cache = _read_catalog_cache(data_dir) or {}
+    if cache.get("index"):
+        merged = {**(cache.get("unmatched") or {}), **unmatched}
+        _write_catalog_cache(data_dir, cache["index"], merged)
+
+
 def maybe_auto_match(data_dir, records, prices):
-    """占位：Task 3 实现自动匹配逻辑。"""
-    return None
+    """发现无价格模型时后台线程自动匹配（不阻塞请求）。返回 Thread 或 None（供测试 join）。"""
+    global _auto_match_last_try
+    todo = unpriced_models(records, prices)
+    if not todo:
+        return None
+    cache = _read_catalog_cache(data_dir)
+    unmatched = (cache or {}).get("unmatched") or {}
+    todo = [m for m in todo if m not in unmatched]
+    now = time.time()
+    if not todo or now - _auto_match_last_try < AUTO_MATCH_MIN_INTERVAL:
+        return None
+    if not _auto_match_lock.acquire(blocking=False):
+        return None
+    _auto_match_last_try = now
+
+    def run():
+        try:
+            auto_match_prices(data_dir, todo)
+        except Exception:
+            pass
+        finally:
+            _auto_match_lock.release()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
 
 
 def import_models_dev(data_dir=None):
@@ -471,7 +534,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(os.path.join(STATIC_DIR, "index.html"))
         elif path == "/api/records":
             records, prices = merged_records()
-            self._send_json({"records": records, "prices": prices, "agents": KNOWN_AGENTS})
+            self._send_json({"records": records, "prices": prices, "agents": KNOWN_AGENTS,
+                             "unpriced": unpriced_models(records, prices)})
         elif path == "/api/plans":
             try:
                 self._send_json(compute_plans())
@@ -550,7 +614,8 @@ class Handler(BaseHTTPRequestHandler):
             cache = to_price(payload.get("cache_read")) if payload.get("cache_read") not in (None, "") else None
             if cache is not None:
                 entry["cache_read"] = cache
-            save_user_price(DATA_DIR, model, entry)
+            with _lock:
+                save_user_price(DATA_DIR, model, entry)
             self._send_json({"ok": True, "model": model.lower(), "price": entry})
             return
         if url.path == "/api/plans":

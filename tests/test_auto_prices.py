@@ -180,5 +180,84 @@ class ImportModelsDevTest(unittest.TestCase):
         self.assertEqual(self._read_prices()["kimi k2"]["input"], 0.6)
 
 
+class AutoMatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        # 预置目录缓存（含一个可匹配模型），避免走网络
+        server._write_catalog_cache(self.tmp, {"new-model": {"input": 1.0, "output": 2.0}}, {})
+
+    def _prices_path(self):
+        return os.path.join(self.tmp, "prices.json")
+
+    def test_fills_missing_only(self):
+        """只补缺失：已有价格（手动 99）不被覆盖；new-model 自动补；no-match 记入 unmatched。"""
+        with open(self._prices_path(), "w", encoding="utf-8") as f:
+            json.dump({"existing": {"input": 9.0, "output": 9.0}}, f)
+        server.auto_match_prices(self.tmp, ["existing", "new-model", "no-match"])
+        with open(self._prices_path(), encoding="utf-8") as f:
+            prices = json.load(f)
+        self.assertEqual(prices["existing"], {"input": 9.0, "output": 9.0})
+        self.assertEqual(prices["new-model"], {"input": 1.0, "output": 2.0})
+        cache = server._read_catalog_cache(self.tmp)
+        self.assertIn("no-match", cache["unmatched"])
+        # 可匹配项不应进 unmatched
+        self.assertNotIn("new-model", cache["unmatched"])
+
+    def test_skips_known_unmatched(self):
+        server._write_catalog_cache(self.tmp, {"new-model": {"input": 1.0, "output": 2.0}},
+                                    {"no-match": int(time.time())})
+        with mock.patch.object(server, "get_catalog_index",
+                               side_effect=AssertionError("不应拉目录")):
+            server.auto_match_prices(self.tmp, ["no-match"])
+        self.assertFalse(os.path.exists(self._prices_path()))
+
+    def test_offline_silent(self):
+        os.remove(os.path.join(self.tmp, "models_dev_cache.json"))
+        with mock.patch.object(server, "_fetch_catalog_json", side_effect=OSError("offline")):
+            server.auto_match_prices(self.tmp, ["new-model"])  # 不抛异常
+        self.assertFalse(os.path.exists(self._prices_path()))
+
+
+class MaybeAutoMatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        server._auto_match_last_try = 0  # 重置全局节流
+
+    def test_spawns_thread(self):
+        with mock.patch.object(server, "auto_match_prices") as am:
+            t = server.maybe_auto_match(self.tmp, [{"model": "New-Model"}], {})
+            self.assertIsNotNone(t)
+            t.join(5)
+            am.assert_called_once_with(self.tmp, ["new-model"])
+
+    def test_skips_when_all_unmatched(self):
+        server._write_catalog_cache(self.tmp, {"x": {"input": 1, "output": 1}},
+                                    {"new-model": int(time.time())})
+        with mock.patch.object(server, "auto_match_prices") as am:
+            t = server.maybe_auto_match(self.tmp, [{"model": "New-Model"}], {})
+            self.assertIsNone(t)
+            am.assert_not_called()
+
+    def test_throttled(self):
+        server._auto_match_last_try = time.time()
+        with mock.patch.object(server, "auto_match_prices") as am:
+            t = server.maybe_auto_match(self.tmp, [{"model": "New-Model"}], {})
+            self.assertIsNone(t)
+            am.assert_not_called()
+
+
+class MergedRecordsHookTest(unittest.TestCase):
+    def test_merged_records_triggers_auto_match(self):
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(server, "DATA_DIR", tmp), \
+             mock.patch.object(server, "DATA_FILE", os.path.join(tmp, "records.json")), \
+             mock.patch.object(server, "maybe_auto_match") as mam:
+            server.save_records([{"id": 1, "date": "2026-07-19", "agent": "A", "model": "Zzz",
+                                  "requests": 1, "input": 1, "output": 1, "cached": 0, "cost": 0}])
+            records, _ = server.merged_records()
+        self.assertTrue(mam.called)
+        self.assertEqual(records[0]["source"], "manual")
+
+
 if __name__ == "__main__":
     unittest.main()
