@@ -18,6 +18,9 @@
     recGran: "day",   // day | hour | minute（明细记录粒度）
     recDate: "",
     recHour: 0,
+    trendGran: "day", // day | hour | minute（趋势图时间粒度）
+    trendDate: "",
+    trendHour: 0,
   };
 
   const PALETTE = ["#7c5cff", "#38bdf8", "#ff8a5c", "#34d399", "#f472b6", "#fbbf24", "#a3e635", "#c084fc", "#22d3ee", "#fb7185"];
@@ -139,6 +142,10 @@
     borderColor: "rgba(255,255,255,0.12)",
     textStyle: { color: "#e8ecf4", fontSize: 12 },
   };
+  const TREND_HINT = "小时/分钟粒度来自本机原始日志，仅含自动采集数据，顶部时间范围不生效";
+
+  const hourOptionsHtml = () => Array.from({ length: 24 }, (_, h) =>
+    `<option value="${h}">${String(h).padStart(2, "0")} 时</option>`).join("");
 
   function rangeDates() {
     const today = new Date();
@@ -163,15 +170,9 @@
     return dates;
   }
 
-  function renderTrend(list) {
-    const dates = rangeDates();
-    const byModel = {};
-    for (const r of list) {
-      if (!byModel[r.model]) byModel[r.model] = {};
-      const v = state.metric === "cost" ? r.cost : totalTokens(r);
-      byModel[r.model][r.date] = (byModel[r.model][r.date] || 0) + v;
-    }
-    const series = Object.keys(byModel).sort().map((model) => ({
+  /* 把 {模型: {桶: 值}} 铺成按 keys 对齐的堆叠面积系列 */
+  function trendSeries(byModel, keys) {
+    return Object.keys(byModel).sort().map((model) => ({
       name: model,
       type: "line",
       stack: "total",
@@ -181,15 +182,18 @@
       areaStyle: { opacity: 0.18, color: colorOf(model) },
       itemStyle: { color: colorOf(model) },
       emphasis: { focus: "series" },
-      data: dates.map((d) => +(byModel[model][d] || 0).toFixed(4)),
+      data: keys.map((k) => +(byModel[model][k] || 0).toFixed(4)),
     }));
+  }
+
+  function setTrendOption(labels, series) {
     chartOf($("#chart-trend")).setOption({
       backgroundColor: "transparent",
       tooltip: { trigger: "axis", ...TOOLTIP_STYLE, valueFormatter: (v) => state.metric === "cost" ? fmtCost(v) : fmtFull(v) },
       legend: { textStyle: { color: "#8b93a7", fontSize: 11 }, icon: "roundRect", itemWidth: 12, itemHeight: 6, top: 0 },
       grid: { left: 8, right: 12, top: 34, bottom: 4, containLabel: true },
       xAxis: {
-        type: "category", data: dates.map((d) => d.slice(5)), boundaryGap: false,
+        type: "category", data: labels, boundaryGap: false,
         axisLine: AXIS_STYLE.axisLine, axisLabel: AXIS_STYLE.axisLabel, axisTick: { show: false },
       },
       yAxis: {
@@ -199,6 +203,66 @@
       },
       series,
     }, true);
+  }
+
+  function renderTrend(list) {
+    if (state.trendGran !== "day") { renderTrendFine(); return; }
+    const dates = rangeDates();
+    const byModel = {};
+    for (const r of list) {
+      if (!byModel[r.model]) byModel[r.model] = {};
+      const v = state.metric === "cost" ? r.cost : totalTokens(r);
+      byModel[r.model][r.date] = (byModel[r.model][r.date] || 0) + v;
+    }
+    setTrendOption(dates.map((d) => d.slice(5)), trendSeries(byModel, dates));
+  }
+
+  /* 小时/分钟粒度：现场重扫原始日志（/api/timeline），只含自动采集数据 */
+  let trendSeq = 0;
+  async function renderTrendFine() {
+    const seq = ++trendSeq;
+    const inst = chartOf($("#chart-trend"));
+    const hint = $("#trend-gran-hint");
+    const params = new URLSearchParams({ day: state.trendDate });
+    if (state.trendGran === "minute") params.set("hour", state.trendHour);
+    hint.textContent = TREND_HINT + " · 加载中…";
+    inst.showLoading("default", { text: "", color: "#7c5cff", maskColor: "rgba(0,0,0,0)" });
+    let data;
+    try {
+      const res = await fetch("/api/timeline?" + params.toString());
+      data = await res.json();
+      if (!res.ok) throw new Error(data.error || "加载失败");
+    } catch (e) {
+      if (seq !== trendSeq) return;   // 已被更新的请求取代
+      inst.hideLoading();
+      hint.textContent = TREND_HINT + " · " + (e.message || "加载失败");
+      return;
+    }
+    if (seq !== trendSeq) return;
+    inst.hideLoading();
+
+    let rows = data.rows || [];
+    if (state.agent !== "all") rows = rows.filter((r) => r.agent === state.agent);
+    if (state.model !== "all") rows = rows.filter((r) => r.model === state.model);
+
+    // 桶键与后端 breakdown() 一致：按小时是 "13"，按分钟是 "13:42"；补齐空桶保证轴连续
+    const hh = String(state.trendHour).padStart(2, "0");
+    const keys = state.trendGran === "hour"
+      ? Array.from({ length: 24 }, (_, h) => String(h).padStart(2, "0"))
+      : Array.from({ length: 60 }, (_, m) => `${hh}:${String(m).padStart(2, "0")}`);
+    const labels = state.trendGran === "hour" ? keys.map((h) => h + ":00") : keys;
+
+    const byModel = {};
+    for (const r of rows) {
+      if (!byModel[r.model]) byModel[r.model] = {};
+      const v = state.metric === "cost" ? (r.cost || 0) : totalTokens(r);
+      byModel[r.model][r.bucket] = (byModel[r.model][r.bucket] || 0) + v;
+    }
+    setTrendOption(labels, trendSeries(byModel, keys));
+    const scope = data.day + (state.trendGran === "minute" ? ` ${hh} 时` : "");
+    hint.textContent = rows.length
+      ? `${TREND_HINT} · ${scope}`
+      : `${TREND_HINT} · ${scope}没有采集到数据`;
   }
 
   function renderModelPie(list) {
@@ -835,10 +899,30 @@
     $("#drawer-close").addEventListener("click", closeDrawer);
     $("#drawer-mask").addEventListener("click", closeDrawer);
 
+    // 消耗趋势：时间粒度切换（按天 / 按小时 / 按分钟）
+    const trendDate = $("#trend-date"), trendHour = $("#trend-hour"), trendHint = $("#trend-gran-hint");
+    trendHour.innerHTML = hourOptionsHtml();
+    state.trendDate = localDateStr(new Date());
+    state.trendHour = new Date().getHours();
+    trendDate.value = state.trendDate;
+    trendHour.value = String(state.trendHour);
+    $$("#trend-gran-seg button").forEach((b) => b.addEventListener("click", () => {
+      state.trendGran = b.dataset.gran;
+      $$("#trend-gran-seg button").forEach((x) => x.classList.toggle("active", x === b));
+      trendDate.hidden = state.trendGran === "day";
+      trendHour.hidden = state.trendGran !== "minute";
+      trendHint.hidden = state.trendGran === "day";
+      render();
+    }));
+    trendDate.addEventListener("change", () => {
+      state.trendDate = trendDate.value || localDateStr(new Date());
+      render();
+    });
+    trendHour.addEventListener("change", () => { state.trendHour = +trendHour.value; render(); });
+
     // 明细记录：时间粒度切换（按天 / 按小时 / 按分钟）
     const recDate = $("#rec-date"), recHour = $("#rec-hour"), recHint = $("#rec-gran-hint");
-    recHour.innerHTML = Array.from({ length: 24 }, (_, h) =>
-      `<option value="${h}">${String(h).padStart(2, "0")} 时</option>`).join("");
+    recHour.innerHTML = hourOptionsHtml();
     state.recDate = localDateStr(new Date());
     state.recHour = new Date().getHours();
     recDate.value = state.recDate;

@@ -80,12 +80,22 @@
         <div class="card">
           <div class="card-head">
             <div class="card-title">消耗趋势</div>
-            <div class="seg small" id="metric-seg">
-              <button data-metric="tokens" class="active">Tokens</button>
-              <button data-metric="cost">费用</button>
+            <div class="trend-controls">
+              <div class="seg small" id="trend-gran-seg">
+                <button data-gran="day" class="active">按天</button>
+                <button data-gran="hour">按小时</button>
+                <button data-gran="minute">按分钟</button>
+              </div>
+              <input type="date" id="trend-date" hidden>
+              <select id="trend-hour" class="select" hidden></select>
+              <div class="seg small" id="metric-seg">
+                <button data-metric="tokens" class="active">Tokens</button>
+                <button data-metric="cost">费用</button>
+              </div>
             </div>
           </div>
           <div class="chart tall" id="chart-trend"></div>
+          <div class="card-hint trend-hint" id="trend-gran-hint" hidden></div>
         </div>
       </div>
       <div class="grid-2">
