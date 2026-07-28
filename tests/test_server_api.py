@@ -2,6 +2,7 @@
 """HTTP 层安全与输入校验测试：Host/Origin 校验、静态目录防穿越、请求体上限、date 校验、原子存储。"""
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -111,6 +112,47 @@ class ApiTest(unittest.TestCase):
         recs = server.load_records()
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["source"], "manual")
+
+    # ---------- 单实例检测 ----------
+    # 双开会让两个进程共用同一份 collector_state.json，交错读改写 offsets 导致漏扫/重复计数
+
+    def test_ping_identifies_app(self):
+        status, data = self.req("/api/ping")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["app"], server.APP_ID)
+
+    def test_probe_finds_running_instance(self):
+        self.assertIsNotNone(server.probe_instance(self.port))
+
+    def test_probe_ignores_closed_port(self):
+        self.assertIsNone(server.probe_instance(_closed_port(), timeout=0.5))
+
+    def test_running_instance_reads_recorded_port(self):
+        """上次没抢到默认端口时，靠 instance.json 记的端口找到自己。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "instance.json")
+            storage.save_json(path, {"port": self.port, "pid": 1})
+            with mock.patch.object(server, "INSTANCE_FILE", path), \
+                 mock.patch.object(server, "DEFAULT_PORT", _closed_port()):
+                self.assertEqual(server.running_instance(), {"port": self.port})
+
+    def test_running_instance_none_when_nothing_listening(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(server, "INSTANCE_FILE",
+                                   os.path.join(tmp, "instance.json")), \
+                 mock.patch.object(server, "DEFAULT_PORT", _closed_port()), \
+                 mock.patch.object(server, "probe_instance", return_value=None):
+                self.assertIsNone(server.running_instance())
+
+
+def _closed_port():
+    """绑一个端口再放掉，拿到一个几乎肯定没人监听的号。"""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 if __name__ == "__main__":

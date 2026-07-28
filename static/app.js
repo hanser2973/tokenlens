@@ -14,6 +14,7 @@
     customTo: "",
     agent: "all",
     model: "all",
+    project: "all",
     metric: "tokens", // tokens | cost
     recGran: "day",   // day | hour | minute（明细记录粒度）
     recDate: "",
@@ -21,6 +22,15 @@
     trendGran: "day", // day | hour | minute（趋势图时间粒度）
     trendDate: "",
     trendHour: 0,
+    settings: { multi_device: "off", sync_dir: "", device: {}, peers: [] },
+  };
+
+  // 多端模式说明：off 单机；local_only 多端未同步（官方百分比仍准，绝对 token 数不可信）；
+  // sync 多端已合并（绝对值恢复可信）
+  const MULTI_TIPS = {
+    off: "只有这一台电脑在用这个账号。官方百分比与本机日志同口径，估算的绝对额度可信。",
+    local_only: "官方给的百分比是账号级的，本机日志只有本机那一份，两者相除会按本机用量占比系统性低估绝对额度。因此这个模式下只显示百分比与重置时间，隐藏所有绝对 token 估算。",
+    sync: "各设备把采集结果写进同一个共享目录（每台只写自己的文件，不会冲突）。OneDrive / 坚果云 / Syncthing / SMB 共享都可以。汇总后绝对额度重新可信。注意：如果你把 AI 工具自身的日志目录（如 ~/.claude）也放进了网盘同步，两边会扫到同一批事件导致重复计数，那种情况请勿开启本模式。",
   };
 
   const PALETTE = ["#7c5cff", "#38bdf8", "#ff8a5c", "#34d399", "#f472b6", "#fbbf24", "#a3e635", "#c084fc", "#22d3ee", "#fb7185"];
@@ -79,23 +89,47 @@
     render();
   }
 
-  function filtered() {
-    let list = state.records;
-    if (state.range === "today") {
-      const t = localDateStr(new Date());
-      list = list.filter((r) => r.date === t);
-    } else if (state.range === "custom") {
-      if (state.customFrom) list = list.filter((r) => r.date >= state.customFrom);
-      if (state.customTo) list = list.filter((r) => r.date <= state.customTo);
-    } else if (state.range > 0) {
-      const from = new Date();
-      from.setDate(from.getDate() - state.range);
-      const fromStr = localDateStr(from);
-      list = list.filter((r) => r.date >= fromStr);
+  function shiftDate(dateStr, days) {
+    const d = new Date(dateStr + "T00:00:00");
+    d.setDate(d.getDate() + days);
+    return localDateStr(d);
+  }
+
+  /* 当前时间范围的统一口径 {from, to, days}；「全部」没有边界，返回 null。
+     统计卡、趋势图 X 轴、环比对比都从这里取，避免三处各算各的对不上。 */
+  function periodBounds() {
+    const today = localDateStr(new Date());
+    if (state.range === "today") return { from: today, to: today, days: 1 };
+    if (state.range === "custom") {
+      if (!state.customFrom || !state.customTo || state.customFrom > state.customTo) return null;
+      const days = Math.round(
+        (new Date(state.customTo + "T00:00:00") - new Date(state.customFrom + "T00:00:00")) / 86400000) + 1;
+      return { from: state.customFrom, to: state.customTo, days };
     }
+    if (state.range > 0) return { from: shiftDate(today, 1 - state.range), to: today, days: state.range };
+    return null;
+  }
+
+  /* 与当前周期等长、紧邻在前的一段，用于环比 */
+  function previousBounds(cur) {
+    if (!cur) return null;
+    const to = shiftDate(cur.from, -1);
+    return { from: shiftDate(to, 1 - cur.days), to, days: cur.days };
+  }
+
+  function inBounds(list, b) {
+    return b ? list.filter((r) => r.date >= b.from && r.date <= b.to) : list;
+  }
+
+  function byFilters(list) {
     if (state.agent !== "all") list = list.filter((r) => r.agent === state.agent);
     if (state.model !== "all") list = list.filter((r) => r.model === state.model);
+    if (state.project !== "all") list = list.filter((r) => (r.project || "") === state.project);
     return list;
+  }
+
+  function filtered() {
+    return byFilters(inBounds(state.records, periodBounds()));
   }
 
   function aggBy(list, key) {
@@ -147,27 +181,22 @@
   const hourOptionsHtml = () => Array.from({ length: 24 }, (_, h) =>
     `<option value="${h}">${String(h).padStart(2, "0")} 时</option>`).join("");
 
+  /* 趋势图 X 轴的日期序列。「全部」没有固定边界，按数据里的最早/最晚一天铺开。 */
   function rangeDates() {
-    const today = new Date();
-    if (state.range === "today") return [localDateStr(today)];
-    if (state.range === "custom" && state.customFrom && state.customTo) {
-      const dates = [];
-      const d = new Date(state.customFrom + "T00:00:00");
-      const end = new Date(state.customTo + "T00:00:00");
-      while (d <= end && dates.length < 370) {
-        dates.push(localDateStr(d));
-        d.setDate(d.getDate() + 1);
-      }
-      if (dates.length) return dates;
+    let b = periodBounds();
+    if (!b) {
+      const days = state.records.map((r) => r.date).filter(Boolean).sort();
+      if (!days.length) return [localDateStr(new Date())];
+      b = { from: days[0], to: days[days.length - 1] };
     }
-    const days = state.range === 7 ? 7 : 30;
     const dates = [];
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
+    const d = new Date(b.from + "T00:00:00");
+    const end = new Date(b.to + "T00:00:00");
+    while (d <= end && dates.length < 800) {
       dates.push(localDateStr(d));
+      d.setDate(d.getDate() + 1);
     }
-    return dates;
+    return dates.length ? dates : [localDateStr(new Date())];
   }
 
   /* 把 {模型: {桶: 值}} 铺成按 keys 对齐的堆叠面积系列 */
@@ -309,29 +338,61 @@
   }
 
   /* ---------- 渲染：总览 ---------- */
+  const sumBy = (list, f) => list.reduce((s, r) => s + f(r), 0);
+
+  /* 环比徽标：与紧邻的等长上一周期比。上期为 0 时不算百分比（除零没意义），
+     只标「新增」；两期都为 0 就什么都不显示。 */
+  function deltaHtml(cur, prev) {
+    if (prev == null) return "";
+    if (!prev && !cur) return "";
+    if (!prev) return `<span class="delta up">新增</span>`;
+    const d = (cur - prev) / prev * 100;
+    const cls = d > 1 ? "up" : d < -1 ? "down" : "flat";
+    const arrow = d > 1 ? "↑" : d < -1 ? "↓" : "≈";
+    return `<span class="delta ${cls}">${arrow} ${Math.abs(d) >= 999 ? "999+" : Math.abs(d).toFixed(0)}%</span>`;
+  }
+
   function renderStats(list) {
-    const tokens = list.reduce((s, r) => s + totalTokens(r), 0);
-    const input = list.reduce((s, r) => s + r.input, 0);
-    const output = list.reduce((s, r) => s + r.output, 0);
-    const cached = list.reduce((s, r) => s + r.cached, 0);
-    const cost = list.reduce((s, r) => s + r.cost, 0);
-    const requests = list.reduce((s, r) => s + r.requests, 0);
+    const tokens = sumBy(list, totalTokens);
+    const input = sumBy(list, (r) => r.input);
+    const output = sumBy(list, (r) => r.output);
+    const cached = sumBy(list, (r) => r.cached);
+    const cost = sumBy(list, (r) => r.cost);
+    const requests = sumBy(list, (r) => r.requests);
     const models = new Set(list.map((r) => r.model)).size;
     const agents = new Set(list.map((r) => r.agent)).size;
+    const projects = new Set(list.map((r) => r.project || "")).size;
     const days = Math.max(1, new Set(list.map((r) => r.date)).size);
     const hitRate = input + cached > 0 ? (cached / (input + cached)) * 100 : 0;
 
+    // 上一周期（同样长度、紧挨在前），「全部」范围下没有可比对象
+    const prevB = previousBounds(periodBounds());
+    const prev = prevB ? byFilters(inBounds(state.records, prevB)) : null;
+    const p = prev && {
+      tokens: sumBy(prev, totalTokens), cost: sumBy(prev, (r) => r.cost),
+      requests: sumBy(prev, (r) => r.requests),
+    };
+    const vs = prevB ? `较上期（${prevB.from.slice(5)}~${prevB.to.slice(5)}）` : "";
+
     const cards = [
-      { label: "总消耗 Tokens", value: fmtNum(tokens), sub: `输入 ${fmtNum(input)} · 输出 ${fmtNum(output)} · 缓存 ${fmtNum(cached)}`, color: "rgba(124,92,255,0.3)" },
-      { label: "总费用（估算）", value: fmtCost(cost), sub: `日均 ${fmtCost(cost / days)}`, color: "rgba(0,212,255,0.28)" },
-      { label: "总请求数", value: fmtFull(requests), sub: `日均 ${fmtFull(Math.round(requests / days))} 次`, color: "rgba(52,211,153,0.28)" },
-      { label: "活跃模型 / Agent", value: `${models} <small>/</small> ${agents}`, sub: `${days} 天有使用记录`, color: "rgba(251,191,36,0.26)" },
-      { label: "缓存命中率", value: hitRate.toFixed(1) + "%", sub: `缓存 ${fmtNum(cached)} / 总输入 ${fmtNum(input + cached)}`, color: "rgba(45,212,191,0.28)" },
+      { label: "总消耗 Tokens", value: fmtNum(tokens), delta: p && deltaHtml(tokens, p.tokens),
+        sub: p ? `${vs} ${fmtNum(p.tokens)}` : `输入 ${fmtNum(input)} · 输出 ${fmtNum(output)} · 缓存 ${fmtNum(cached)}`,
+        color: "rgba(124,92,255,0.3)" },
+      { label: "总费用（估算）", value: fmtCost(cost), delta: p && deltaHtml(cost, p.cost),
+        sub: p ? `日均 ${fmtCost(cost / days)} · ${vs} ${fmtCost(p.cost)}` : `日均 ${fmtCost(cost / days)}`,
+        color: "rgba(0,212,255,0.28)" },
+      { label: "总请求数", value: fmtFull(requests), delta: p && deltaHtml(requests, p.requests),
+        sub: p ? `日均 ${fmtFull(Math.round(requests / days))} 次 · ${vs} ${fmtFull(p.requests)}` : `日均 ${fmtFull(Math.round(requests / days))} 次`,
+        color: "rgba(52,211,153,0.28)" },
+      { label: "活跃模型 / Agent", value: `${models} <small>/</small> ${agents}`,
+        sub: `${projects} 个项目 · ${days} 天有使用记录`, color: "rgba(251,191,36,0.26)" },
+      { label: "缓存命中率", value: hitRate.toFixed(1) + "%",
+        sub: `缓存 ${fmtNum(cached)} / 总输入 ${fmtNum(input + cached)}`, color: "rgba(45,212,191,0.28)" },
     ];
     $("#stat-cards").innerHTML = cards.map((c) => `
       <div class="stat-card" style="--sc:${c.color}">
         <div class="stat-label">${c.label}</div>
-        <div class="stat-value">${c.value}</div>
+        <div class="stat-value">${c.value}${c.delta || ""}</div>
         <div class="stat-sub">${c.sub}</div>
       </div>`).join("");
   }
@@ -419,6 +480,13 @@
     return total > 0 ? ((r.cached / total) * 100).toFixed(1) + "%" : "—";
   }
 
+  /* 记录来源：本机自动采集 / 其他设备同步而来 / 手动录入（可删） */
+  function sourceCell(r) {
+    if (r.source === "auto") return '<span class="auto-badge">自动</span>';
+    if (r.source === "remote") return `<span class="remote-badge" title="来自其他设备">⇄ ${esc(r.device || "其他设备")}</span>`;
+    return `<button class="row-del" data-id="${r.id}" title="删除">✕</button>`;
+  }
+
   function renderRecords(list) {
     const rows = [...list].sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
     $("#records-count").textContent = `共 ${rows.length} 条`;
@@ -427,6 +495,7 @@
         <td>${esc(r.date)}</td>
         <td><span class="tag"><i style="background:${colorOf(r.agent)}"></i>${esc(r.agent)}</span></td>
         <td><span class="tag"><i style="background:${colorOf(r.model)}"></i>${esc(r.model)}</span></td>
+        <td>${r.project ? `<span class="tag"><i style="background:${colorOf(r.project)}"></i>${esc(r.project)}</span>` : "—"}</td>
         <td class="num">${fmtFull(r.requests)}</td>
         <td class="num">${fmtFull(r.input)}</td>
         <td class="num">${fmtFull(r.output)}</td>
@@ -434,8 +503,8 @@
         <td class="num">${hitRate(r)}</td>
         <td class="num"><b>${fmtFull(totalTokens(r))}</b></td>
         <td class="num">${fmtCost(r.cost)}</td>
-        <td class="num">${r.source === "auto" ? '<span class="auto-badge">自动</span>' : `<button class="row-del" data-id="${r.id}" title="删除">✕</button>`}</td>
-      </tr>`).join("") || `<tr><td colspan="11" class="empty">暂无数据：点击左下「同步本地数据」扫描本机 AI 工具日志，或「录入数据」手动添加</td></tr>`;
+        <td class="num">${sourceCell(r)}</td>
+      </tr>`).join("") || `<tr><td colspan="12" class="empty">暂无数据：点击左下「同步本地数据」扫描本机 AI 工具日志，或「录入数据」手动添加</td></tr>`;
 
     $$("#records-tbody .row-del").forEach((btn) => btn.addEventListener("click", async (e) => {
       e.stopPropagation();
@@ -452,7 +521,7 @@
     const params = new URLSearchParams({ day: state.recDate });
     if (state.recGran === "minute") params.set("hour", state.recHour);
     $("#records-count").textContent = "加载中…";
-    tbody.innerHTML = `<tr><td colspan="11" class="empty">加载中…</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="empty">加载中…</td></tr>`;
     let data;
     try {
       const res = await fetch("/api/timeline?" + params.toString());
@@ -460,7 +529,7 @@
       if (!res.ok) throw new Error(data.error || "加载失败");
     } catch (e) {
       $("#records-count").textContent = "";
-      tbody.innerHTML = `<tr><td colspan="11" class="empty">${esc(e.message || "加载失败")}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="12" class="empty">${esc(e.message || "加载失败")}</td></tr>`;
       return;
     }
     let rows = data.rows || [];
@@ -474,6 +543,7 @@
         <td>${label}</td>
         <td><span class="tag"><i style="background:${colorOf(r.agent)}"></i>${esc(r.agent)}</span></td>
         <td><span class="tag"><i style="background:${colorOf(r.model)}"></i>${esc(r.model)}</span></td>
+        <td class="dim" title="小时/分钟粒度不带项目维度">—</td>
         <td class="num">${fmtFull(r.requests)}</td>
         <td class="num">${fmtFull(r.input)}</td>
         <td class="num">${fmtFull(r.output)}</td>
@@ -483,10 +553,15 @@
         <td class="num">${fmtCost(r.cost || 0)}</td>
         <td class="num"><span class="auto-badge">自动</span></td>
       </tr>`;
-    }).join("") || `<tr><td colspan="11" class="empty">该时段没有采集到数据（小时/分钟粒度仅含自动采集数据，手动记录请切回「按天」）</td></tr>`;
+    }).join("") || `<tr><td colspan="12" class="empty">该时段没有采集到数据（小时/分钟粒度仅含自动采集数据，手动记录请切回「按天」）</td></tr>`;
   }
 
   /* ---------- 抽屉 ---------- */
+  // 抽屉里「相关记录」那一列展示的是另一个维度
+  const DRAWER_EXTRA = { model: "agent", agent: "model", project: "model" };
+  const DRAWER_TAG = { model: "模型详情", agent: "Agent 详情", project: "项目详情" };
+  const DIM_LABEL = { model: "模型", agent: "Agent", project: "项目" };
+
   function openDrawer(type, name) {
     const list = state.records.filter((r) => r[type] === name);
     if (!list.length) return;
@@ -496,11 +571,12 @@
     const input = list.reduce((s, r) => s + r.input, 0);
     const output = list.reduce((s, r) => s + r.output, 0);
     const cached = list.reduce((s, r) => s + r.cached, 0);
-    const others = new Set(list.map((r) => r[type === "model" ? "agent" : "model"]));
+    const extraKey = DRAWER_EXTRA[type] || "model";
+    const others = new Set(list.map((r) => r[extraKey]));
 
-    $("#drawer-tag").textContent = type === "model" ? "模型详情" : "Agent 详情";
+    $("#drawer-tag").textContent = DRAWER_TAG[type] || "详情";
     $("#drawer-title").textContent = name;
-    $("#drawer-col-extra").textContent = type === "model" ? "Agent" : "模型";
+    $("#drawer-col-extra").textContent = DIM_LABEL[extraKey];
     $("#drawer-stats").innerHTML = [
       ["总 Tokens", fmtNum(tokens)],
       ["费用", fmtCost(cost)],
@@ -511,7 +587,7 @@
     ].map(([l, v]) => `<div class="ds"><div class="ds-label">${l}</div><div class="ds-value">${v}</div></div>`).join("")
       + (type === "model" && state.prices[String(name).toLowerCase()]
         ? `<div class="ds"><div class="ds-label">单价（入/出 每百万）</div><div class="ds-value">$${state.prices[String(name).toLowerCase()].input} / $${state.prices[String(name).toLowerCase()].output}</div></div>`
-        : `<div class="ds"><div class="ds-label">关联${type === "model" ? "Agent" : "模型"}数</div><div class="ds-value">${others.size}</div></div>`);
+        : `<div class="ds"><div class="ds-label">关联${DIM_LABEL[extraKey]}数</div><div class="ds-value">${others.size}</div></div>`);
 
     $("#drawer-mask").classList.add("show");
     $("#drawer").classList.add("show");
@@ -535,7 +611,6 @@
       }],
     }, true);
 
-    const extraKey = type === "model" ? "agent" : "model";
     const rows = [...list].sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id).slice(0, 20);
     $("#drawer-tbody").innerHTML = rows.map((r) => `
       <tr>
@@ -593,6 +668,7 @@
     const models = [...new Set([...Object.keys(state.prices), ...state.records.map((r) => r.model)])];
     $("#dl-agents").innerHTML = agents.map((a) => `<option value="${esc(a)}">`).join("");
     $("#dl-models").innerHTML = models.map((m) => `<option value="${esc(m)}">`).join("");
+    $("#dl-projects").innerHTML = projectNames().map((p) => `<option value="${esc(p)}">`).join("");
   }
 
   function updateCostTip() {
@@ -616,6 +692,7 @@
       date: f.date.value,
       agent: f.agent.value.trim(),
       model: f.model.value.trim(),
+      project: f.project.value.trim(),
       requests: +f.requests.value || 0,
       input: +f.input.value || 0,
       output: +f.output.value || 0,
@@ -642,14 +719,20 @@
 
   /* ---------- 筛选 & 视图切换 ---------- */
   function buildFilterOptions() {
-    const agents = [...new Set(state.records.map((r) => r.agent))].sort();
-    const models = [...new Set(state.records.map((r) => r.model))].sort();
-    const keepA = state.agent, keepM = state.model;
-    $("#filter-agent").innerHTML = `<option value="all">全部 Agent</option>` + agents.map((a) => `<option ${a === keepA ? "selected" : ""} value="${esc(a)}">${esc(a)}</option>`).join("");
-    $("#filter-model").innerHTML = `<option value="all">全部模型</option>` + models.map((m) => `<option ${m === keepM ? "selected" : ""} value="${esc(m)}">${esc(m)}</option>`).join("");
+    const opts = (sel, all, values, keep) => {
+      $(sel).innerHTML = `<option value="all">${all}</option>` + values.map((v) =>
+        `<option ${v === keep ? "selected" : ""} value="${esc(v)}">${esc(v)}</option>`).join("");
+    };
+    opts("#filter-agent", "全部 Agent", [...new Set(state.records.map((r) => r.agent))].sort(), state.agent);
+    opts("#filter-model", "全部模型", [...new Set(state.records.map((r) => r.model))].sort(), state.model);
+    opts("#filter-project", "全部项目", projectNames(), state.project);
   }
 
-  const VIEW_TITLES = { overview: "总览", models: "模型", agents: "Agent", records: "明细记录", plans: "Plan 用量" };
+  function projectNames() {
+    return [...new Set(state.records.map((r) => r.project).filter(Boolean))].sort();
+  }
+
+  const VIEW_TITLES = { overview: "总览", models: "模型", agents: "Agent", projects: "项目", records: "明细记录", plans: "Plan 用量" };
 
   function switchView(view) {
     state.view = view;
@@ -662,6 +745,15 @@
       const inst = echarts.getInstanceByDom(el);
       if (inst) inst.resize();
     }), 30);
+  }
+
+  const UNKNOWN_PROJECT = "未知项目";
+
+  function renderProjectsHint() {
+    const unknown = state.records.filter((r) => r.project === UNKNOWN_PROJECT).length;
+    $("#projects-hint").textContent =
+      "项目名取自各工具记录的工作目录（Kimi 取会话目录名，Cline 系不记录工作目录）"
+      + (unknown ? ` · ${unknown} 条归入「${UNKNOWN_PROJECT}」，多为升级前采集的老数据，可点右侧重建` : "");
   }
 
   function renderModelsHint() {
@@ -686,6 +778,9 @@
       renderEntityCards(list, "model", "#model-cards", "model");
     } else if (state.view === "agents") {
       renderEntityCards(list, "agent", "#agent-cards", "agent");
+    } else if (state.view === "projects") {
+      renderProjectsHint();
+      renderEntityCards(list, "project", "#project-cards", "project");
     } else if (state.view === "records") {
       if (state.recGran === "day") renderRecords(list);
       else renderTimeline();
@@ -706,14 +801,52 @@
     return `${parts}后重置`;
   }
 
-  function planWinHtml(pct, title, sub) {
+  /* actions：窗口右上角的操作区 HTML（目前只有额度估计开关），手动配额不传 */
+  function planWinHtml(pct, title, sub, actions) {
     pct = Math.min(100, pct);
     return `
       <div class="plan-win">
-        <div class="plan-win-head"><span>${title}</span><span style="color:${planColor(pct)}">已用 ${pct}%</span></div>
+        <div class="plan-win-head">
+          <span>${title}</span>
+          <span class="plan-win-right">${actions || ""}<span style="color:${planColor(pct)}">已用 ${pct}%</span></span>
+        </div>
         <div class="plan-bar"><i style="width:${pct}%;background:${planColor(pct)}"></i></div>
         <div class="plan-sub">${sub}</div>
       </div>`;
+  }
+
+  /* 额度估计开关：多端时本机观测口径未必干净，让用户自己决定何时锚定、何时干脆不看 */
+  function estToggleHtml(w) {
+    if (!w.cal_key || w.absolute_hidden) return "";  // 已隐藏绝对值时开关没有意义
+    const on = !!w.est_enabled;
+    return `<button class="est-toggle${on ? "" : " off"}" data-key="${esc(w.cal_key)}"
+      data-enabled="${on ? 1 : 0}"
+      title="${on ? "停止后只显示官方百分比与重置时间" : "从当前时刻重新锚定，丢弃之前的校准值"}"
+      >${on ? "停止估计" : "开始估计"}</button>`;
+  }
+
+  function fmtAgo(ts) {
+    if (!ts) return "时间未知";
+    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (s < 90) return "刚刚";
+    if (s < 5400) return `${Math.round(s / 60)} 分钟前`;
+    if (s < 172800) return `${Math.round(s / 3600)} 小时前`;
+    return `${Math.round(s / 86400)} 天前`;
+  }
+
+  function renderMultiBanner(data) {
+    const box = $("#multi-banner");
+    const mode = data.multi_device || "off";
+    if (mode === "off") { box.innerHTML = ""; return; }
+    if (mode === "local_only") {
+      box.innerHTML = `<div class="multi-note warn">⚠ 多端使用但未同步：百分比与重置时间来自官方、仍然准确；由本机日志换算的绝对 token 数会系统性低估，已隐藏。配置共享目录后可恢复。</div>`;
+      return;
+    }
+    const peers = data.peers || [];
+    const list = peers.length
+      ? peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}${p.stale ? " · 可能已离线" : ""}）`).join("、")
+      : "还没读到其他设备的数据 —— 确认另一台也已开启合并并指向同一个目录";
+    box.innerHTML = `<div class="multi-note ok">⇄ 多端合并已开启 · 其他设备：${list}</div>`;
   }
 
   async function renderPlans() {
@@ -739,14 +872,23 @@
       const wins = (a.windows || []).map((w) => {
         const subs = [];
         if (w.resets_at) subs.push(fmtReset(w.resets_at));
-        subs.push(`本窗口采集 ${fmtNum(w.measured_tokens)} tokens`);
-        if (w.est_quota) {
-          const tag = w.est_carried ? "（跨设备校准）" : "";
+        const scope = w.measured_remote
+          ? `本窗口合计 ${fmtNum(w.measured_tokens)} tokens（本机 ${fmtNum(w.measured_local)} + 其他设备 ${fmtNum(w.measured_remote)}）`
+          : `本窗口采集 ${fmtNum(w.measured_tokens)} tokens${w.account_wide ? "" : "（仅本机）"}`;
+        subs.push(scope);
+        if (w.absolute_hidden) {
+          subs.push("多端未同步，绝对额度不可估（百分比与重置时间仍然准确）");
+        } else if (w.est_paused) {
+          subs.push("额度估计已停止 · 百分比与重置时间仍来自官方，依然准确");
+        } else if (w.est_quota) {
+          const tag = w.est_carried ? "（沿用上次校准值）" : "";
           subs.push(`估算总额 ≈ ${fmtNum(w.est_quota)}${tag} · 剩余 ≈ ${fmtNum(w.est_remaining)}`);
+        } else if (w.est_calibrating) {
+          subs.push(`正在重新校准（${fmtAgo(w.est_since)}开始）· 官方百分比再涨 1% 即可给出估算`);
         } else {
           subs.push("暂无足够数据估算绝对额度");
         }
-        return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "));
+        return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "), estToggleHtml(w));
       }).join("");
       const updated = (a.updated || "").replace("T", " ").slice(5, 16);
       cards.push(`
@@ -758,11 +900,17 @@
     for (const p of data.manual || []) {
       let sub;
       if (p.mode === "percent") {
-        sub = p.est_quota
-          ? `已用 ${fmtFull(p.used)} · 估算总额 ≈ ${fmtNum(p.est_quota)} · 剩余 ≈ ${fmtNum(p.remaining)}（按 ${p.anchor_pct}% 锚定）`
-          : `锚定时本窗口无采集数据，暂无法估算总额（当前已用 ${p.pct}%）`;
+        if (p.absolute_hidden) {
+          sub = `已用约 ${p.pct}%（按 ${p.anchor_pct}% 锚定）· 多端未同步，绝对 token 数不可估`;
+        } else {
+          sub = p.est_quota
+            ? `已用 ${fmtFull(p.used)} · 估算总额 ≈ ${fmtNum(p.est_quota)} · 剩余 ≈ ${fmtNum(p.remaining)}（按 ${p.anchor_pct}% 锚定）`
+            : `锚定时本窗口无采集数据，暂无法估算总额（当前已用 ${p.pct}%）`;
+        }
       } else {
         sub = `已用 ${fmtFull(p.used)} / 配额 ${fmtFull(p.quota)} · 剩余 ${fmtFull(p.remaining)}`;
+        // 固定配额是唯一朝危险方向偏的路径：配额是账号级的，已用却只有本机
+        if (p.understated) sub += " ⚠ 已用仅含本机，实际消耗更多、剩余更少";
       }
       cards.push(`
       <div class="card plan-card">
@@ -770,6 +918,7 @@
         ${planWinHtml(p.pct, `${esc(p.agent)} · ${esc(p.period_label)}`, sub)}
       </div>`);
     }
+    renderMultiBanner(data);
     if (!cards.length) {
       cards.push(`<div class="card"><div class="card-hint">暂无 Plan 数据：未发现 Codex 限额记录，可点右上「添加配额」手动跟踪 Kimi / Claude 等套餐。</div></div>`);
     }
@@ -810,6 +959,28 @@
 
     $("#filter-agent").addEventListener("change", (e) => { state.agent = e.target.value; render(); });
     $("#filter-model").addEventListener("change", (e) => { state.model = e.target.value; render(); });
+    $("#filter-project").addEventListener("change", (e) => { state.project = e.target.value; render(); });
+
+    $("#btn-rebuild").addEventListener("click", async (e) => {
+      if (!confirm("将清空采集状态并重新扫描全部本机日志（原文件会先备份）。\n手动录入的记录不受影响。继续？")) return;
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "⟲ 重扫中…";
+      try {
+        const res = await fetch("/api/collect/rebuild", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) { toast(data.error || "重建失败"); return; }
+        const parts = Object.entries(data.summary || {})
+          .map(([agent, s]) => `${agent} ${s.events} 条`);
+        toast(parts.length ? `重建完成 ｜ ${parts.join("；")}` : "未发现本机 AI 工具日志");
+        await loadData();
+      } catch (err) {
+        toast("重建失败");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "⟲ 重建采集数据";
+      }
+    });
 
     $("#btn-add").addEventListener("click", openModal);
     $("#btn-sync").addEventListener("click", syncData);
@@ -849,6 +1020,62 @@
     $("#modal-mask").addEventListener("click", (e) => { if (e.target.id === "modal-mask") closeModal(); });
 
     // Plan 配额弹窗与删除
+    // 多端设置
+    const multiMask = $("#multi-modal-mask");
+    const multiForm = $("#multi-form");
+    const closeMultiModal = () => multiMask.classList.remove("show");
+    function syncMultiUI() {
+      const mode = $("#multi-mode").value;
+      $("#multi-dir-row").hidden = mode !== "sync";
+      $("#multi-tip").textContent = MULTI_TIPS[mode] || "";
+    }
+    function renderMultiPeers(s) {
+      const peers = s.peers || [];
+      const self = `本机：${esc(s.device?.name || "未命名")}`;
+      $("#multi-peers").innerHTML = s.multi_device === "sync"
+        ? `<div class="form-tip">${self}；读到 ${peers.length} 台其他设备${peers.length ? "：" + peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}，${p.days} 条日聚合）`).join("、") : ""}</div>`
+        : `<div class="form-tip">${self}</div>`;
+    }
+    async function openMultiModal() {
+      try {
+        const res = await fetch("/api/settings");
+        state.settings = await res.json();
+      } catch (e) { toast("读取设置失败"); return; }
+      const s = state.settings;
+      multiForm.device_name.value = s.device?.name || "";
+      $("#multi-mode").value = s.multi_device || "off";
+      multiForm.sync_dir.value = s.sync_dir || "";
+      syncMultiUI();
+      renderMultiPeers(s);
+      multiMask.classList.add("show");
+    }
+    $("#btn-multi").addEventListener("click", openMultiModal);
+    $("#multi-modal-close").addEventListener("click", closeMultiModal);
+    multiMask.addEventListener("click", (e) => { if (e.target === multiMask) closeMultiModal(); });
+    $("#multi-mode").addEventListener("change", syncMultiUI);
+    multiForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const payload = {
+        multi_device: $("#multi-mode").value,
+        sync_dir: multiForm.sync_dir.value.trim(),
+        device_name: multiForm.device_name.value.trim(),
+      };
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(data.error || "保存失败"); return; }
+      state.settings = data;
+      toast(payload.multi_device === "sync"
+        ? `已开启多端合并，导出 ${data.shared} 条`
+        : "多端设置已保存");
+      closeMultiModal();
+      await loadData();
+      renderPlans();
+    });
+
     const planMask = $("#plan-modal-mask");
     const closePlanModal = () => planMask.classList.remove("show");
     $("#btn-add-plan").addEventListener("click", () => { buildDatalists(); planMask.classList.add("show"); });
@@ -891,10 +1118,31 @@
     }
     $("#plan-mode").addEventListener("change", togglePlanMode);
     $("#plan-cards").addEventListener("click", async (e) => {
-      const btn = e.target.closest(".plan-del");
-      if (!btn) return;
-      const res = await fetch(`/api/plans?id=${btn.dataset.id}`, { method: "DELETE" });
-      if (res.ok) { toast("已删除配额"); renderPlans(); }
+      const del = e.target.closest(".plan-del");
+      if (del) {
+        const res = await fetch(`/api/plans?id=${del.dataset.id}`, { method: "DELETE" });
+        if (res.ok) { toast("已删除配额"); renderPlans(); }
+        return;
+      }
+      const est = e.target.closest(".est-toggle");
+      if (!est) return;
+      const enable = est.dataset.enabled !== "1";
+      if (enable && !confirm("将丢弃已有校准值，从当前时刻重新锚定估算。继续？")) return;
+      est.disabled = true;
+      try {
+        const res = await fetch("/api/quota/estimate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: est.dataset.key, enabled: enable }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { toast(data.error || "操作失败"); est.disabled = false; return; }
+        toast(enable ? "已从当前时刻重新开始估计" : "已停止额度估计");
+        renderPlans();
+      } catch (err) {
+        toast("操作失败");
+        est.disabled = false;
+      }
     });
     $("#drawer-close").addEventListener("click", closeDrawer);
     $("#drawer-mask").addEventListener("click", closeDrawer);
@@ -985,7 +1233,7 @@
       }
     });
 
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); closePlanModal(); closePriceModal(); } });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); closePlanModal(); closePriceModal(); closeMultiModal(); } });
 
     const f = $("#add-form");
     f.addEventListener("submit", submitForm);

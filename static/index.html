@@ -29,6 +29,9 @@
       <button class="nav-item" data-view="agents">
         <span class="nav-ico">⬡</span> Agent
       </button>
+      <button class="nav-item" data-view="projects">
+        <span class="nav-ico">▤</span> 项目
+      </button>
       <button class="nav-item" data-view="records">
         <span class="nav-ico">☰</span> 明细记录
       </button>
@@ -70,6 +73,7 @@
         </div>
         <select id="filter-agent" class="select"><option value="all">全部 Agent</option></select>
         <select id="filter-model" class="select"><option value="all">全部模型</option></select>
+        <select id="filter-project" class="select"><option value="all">全部项目</option></select>
       </div>
     </header>
 
@@ -134,6 +138,15 @@
       <div class="entity-grid" id="agent-cards"></div>
     </section>
 
+    <!-- 项目 -->
+    <section id="view-projects" class="view">
+      <div class="plan-toolbar">
+        <span class="card-hint" id="projects-hint"></span>
+        <button class="btn-ghost" id="btn-rebuild">⟲ 重建采集数据</button>
+      </div>
+      <div class="entity-grid" id="project-cards"></div>
+    </section>
+
     <!-- 明细记录 -->
     <section id="view-records" class="view">
       <div class="card">
@@ -155,7 +168,7 @@
           <table class="table">
             <thead>
               <tr>
-                <th>日期</th><th>Agent</th><th>模型</th>
+                <th>日期</th><th>Agent</th><th>模型</th><th>项目</th>
                 <th class="num">请求数</th><th class="num">输入</th>
                 <th class="num">输出</th><th class="num">缓存</th>
                 <th class="num">缓存命中率</th>
@@ -171,8 +184,10 @@
     <section id="view-plans" class="view">
       <div class="plan-toolbar">
         <span class="card-hint">Kimi / Codex 自动读取官方配额；其他工具可添加配额手动跟踪</span>
+        <button class="btn-ghost" id="btn-multi">⇄ 多端设置</button>
         <button class="btn-primary" id="btn-add-plan">＋ 添加配额</button>
       </div>
+      <div id="multi-banner"></div>
       <div class="entity-grid" id="plan-cards"></div>
     </section>
   </main>
@@ -226,6 +241,11 @@
         <input type="text" name="model" list="dl-models" placeholder="如 Kimi K2" required>
         <datalist id="dl-models"></datalist>
       </div>
+      <div class="form-row">
+        <label>项目（可选）</label>
+        <input type="text" name="project" list="dl-projects" maxlength="60" placeholder="留空归入「未知项目」">
+        <datalist id="dl-projects"></datalist>
+      </div>
       <div class="form-grid">
         <div class="form-row"><label>请求数</label><input type="number" name="requests" min="0" value="1"></div>
         <div class="form-row"><label>输入 Tokens</label><input type="number" name="input" min="0" value="0"></div>
@@ -243,6 +263,36 @@
 </div>
 
 <!-- 添加配额弹窗 -->
+<div class="modal-mask" id="multi-modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">多端设置</div>
+      <button class="icon-btn" id="multi-modal-close">✕</button>
+    </div>
+    <form id="multi-form" class="form">
+      <div class="form-row">
+        <label>本机名称</label>
+        <input type="text" name="device_name" maxlength="40" placeholder="用于区分是哪台电脑">
+      </div>
+      <div class="form-row">
+        <label>使用方式</label>
+        <select name="multi_device" class="select" id="multi-mode">
+          <option value="off" selected>单机使用</option>
+          <option value="local_only">多台电脑共用账号，不同步</option>
+          <option value="sync">多台电脑共用账号，合并数据</option>
+        </select>
+      </div>
+      <div class="form-row" id="multi-dir-row" hidden>
+        <label>共享目录</label>
+        <input type="text" name="sync_dir" placeholder="如 D:\OneDrive\tokenlens-sync">
+      </div>
+      <div class="form-tip" id="multi-tip"></div>
+      <div id="multi-peers"></div>
+      <button type="submit" class="btn-primary wide">保存</button>
+    </form>
+  </div>
+</div>
+
 <div class="modal-mask" id="plan-modal-mask">
   <div class="modal">
     <div class="modal-head">

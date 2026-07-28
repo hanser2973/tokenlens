@@ -20,6 +20,7 @@ import urllib.request
 import collector
 import quota
 import storage
+import sync
 from pricing import load_prices, calc_cost, save_user_price
 
 if getattr(sys, "frozen", False):
@@ -33,8 +34,22 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 STATIC_PREFIX = os.path.normcase(STATIC_DIR) + os.sep  # 静态文件防目录穿越的比较前缀
 DATA_FILE = os.path.join(DATA_DIR, "records.json")
 PLANS_FILE = os.path.join(DATA_DIR, "plans.json")
-CAL_FILE = os.path.join(DATA_DIR, "quota_cal.json")  # 跨设备配额校准值（本地保存，勿公开提交）
+CAL_FILE = os.path.join(DATA_DIR, "quota_cal.json")  # 配额校准值（本地保存，勿公开提交）
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+INSTANCE_FILE = os.path.join(DATA_DIR, "instance.json")  # 已运行实例的端口，用于单实例检测
+DEFAULT_PORT = 8399
+APP_ID = "tokenlens"  # /api/ping 的标识，用来区分「端口被自己占了」和「被别的程序占了」
 COLLECT_INTERVAL = 600  # 每 10 分钟自动扫描一次本地日志
+COLLECT_FRESH_WINDOW = 30  # 秒：这段时间内刚采集过，时间线就直接用现成的分钟桶
+
+# 多端模式：
+#   off        单机使用，沿用原有行为
+#   local_only 多台电脑共用一个账号，但没有共享目录可同步 —— 官方百分比仍然准确，
+#              但由本机日志换算出的绝对 token 数会按本机用量占比系统性低估，
+#              因此隐藏所有绝对估算，只展示可信的百分比与重置时间
+#   sync       多端 + 已配置共享目录 —— 汇总各设备的采集结果，绝对值重新可信
+MULTI_MODES = ("off", "local_only", "sync")
+DEFAULT_SETTINGS = {"multi_device": "off", "sync_dir": ""}
 
 # 手动配额的周期定义：标签 + 周期秒数（按滚动窗口统计）
 PLAN_PERIODS = {
@@ -44,6 +59,9 @@ PLAN_PERIODS = {
 }
 
 _lock = threading.Lock()
+_cal_lock = threading.Lock()      # quota_cal.json 的读改写
+_collect_lock = threading.Lock()  # 同一时刻只允许一次采集
+_last_collect_at = 0.0
 
 # 供下拉列表使用的常见 Agent 名（实际数据以扫描结果为准）
 KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "Cursor", "Cline", "Trae", "Gemini CLI", "Aider"]
@@ -71,6 +89,7 @@ def seed_demo_data():
         "Cursor": ["GPT-5.2", "Gemini 3 Pro"], "Codex CLI": ["GPT-5.2"],
         "Cline": ["DeepSeek V3.2", "Qwen3 Coder"], "Trae": ["Doubao Seed 1.6"],
     }
+    projects = ["tokenlens", "web-console", "data-pipeline", "mobile-app"]
     records, rid, today = [], 1, date.today()
     for d in range(45, 0, -1):
         day = today - timedelta(days=d)
@@ -87,6 +106,7 @@ def seed_demo_data():
                 cached = int(inp * rng.uniform(0.0, 0.35))
                 records.append({
                     "id": rid, "date": day.isoformat(), "agent": agent, "model": model,
+                    "project": rng.choice(projects),
                     "requests": req, "input": inp, "output": out, "cached": cached,
                     "cost": calc_cost(prices, model, inp, out, cached), "source": "demo",
                 })
@@ -105,13 +125,55 @@ CONTENT_TYPES = {
 }
 
 
-def merged_records():
+def load_settings():
+    d = storage.load_json(SETTINGS_FILE, {})
+    s = dict(DEFAULT_SETTINGS)
+    if isinstance(d, dict):
+        if d.get("multi_device") in MULTI_MODES:
+            s["multi_device"] = d["multi_device"]
+        if isinstance(d.get("sync_dir"), str):
+            s["sync_dir"] = d["sync_dir"]
+    # 声明了 sync 却没有可用目录时降级，避免展示「已合并」的假象
+    if s["multi_device"] == "sync" and not s["sync_dir"]:
+        s["multi_device"] = "local_only"
+    return s
+
+
+def save_settings(s):
+    storage.save_json(SETTINGS_FILE, s, indent=2)
+
+
+def settings_payload():
+    """设置 + 本机身份 + 当前能读到的对端概况，供设置面板展示。"""
+    s = load_settings()
+    ident = sync.device_identity(DATA_DIR)
+    peers = active_peers(s)
+    return {
+        **s,
+        "device": ident,
+        "peers": [{"device_name": p["device_name"], "device_id": p["device_id"],
+                   "updated": p["updated"], "stale": p["stale"], "days": len(p["days"])}
+                  for p in peers],
+    }
+
+
+def active_peers(settings=None):
+    """sync 模式下返回其他设备的数据，其余模式返回空列表。"""
+    s = settings or load_settings()
+    if s["multi_device"] != "sync":
+        return []
+    return sync.read_peers(DATA_DIR, s["sync_dir"])
+
+
+def merged_records(settings=None):
     prices = load_prices(DATA_DIR)
     manual = load_records()
     for r in manual:
         r.setdefault("source", "manual")
+        # 手动录入可以不填项目；和采集不到工作目录的记录归到同一桶，别分裂成两个
+        r.setdefault("project", collector.UNKNOWN_PROJECT)
     auto = collector.load_auto_records(DATA_DIR, prices, calc_cost)
-    records = manual + auto
+    records = manual + auto + sync.peer_records(active_peers(settings), prices, calc_cost)
     maybe_auto_match(DATA_DIR, records, prices)  # 发现新模型时后台自动补价
     return records, prices
 
@@ -213,15 +275,38 @@ def get_catalog_index(data_dir, force=False):
     return index
 
 
+MODEL_BOUNDARY = "-._/: "  # 模型 id 里分隔系列与版本/变体的字符
+
+
 def match_model(index, model):
-    """按 别名 → 精确 → 子串（取最短 id）匹配目录，返回价格 entry 或 None。"""
+    """按 别名 → 精确 → 边界对齐的前缀 匹配目录，返回价格 entry 或 None。
+
+    只接受在分隔符处对齐的前缀匹配，两个方向的取法不同：
+    - 目录 id 是我们模型名的前缀（'gpt-5.2' ⊂ 'gpt-5.2-2026-01-01'）：本机名更具体，
+      取**最长**的目录 id，也就是最贴近的那个系列；
+    - 我们的模型名是目录 id 的前缀（'gpt-5.2' ⊂ 'gpt-5.2-mini'）：目录里全是更具体的
+      变体，取**最短**的那个，即最接近基础款。
+    前者优先 —— 有精确到版本的系列匹配时，不该退回去猜变体。
+
+    早先用的是「任意子串 + 取最短 id」，短 id 几乎是任何长模型名的子串，会稳定截胡：
+    'gpt-5' 抢走 'gpt-5-mini-2025'（贵 5 倍）、'k2' 抢走 'kimi-k2.7-code-turbo'（错系列）。
+    配错的价格还会被 auto_match_prices 写进 prices.json 且不再重试，用户完全无感。
+    宁可匹配不到 —— 界面会打「未定价」徽标提示手动录入。
+    """
     target = MODEL_ALIASES.get(model, model)
     entry = index.get(target)
     if entry:
         return entry
-    subs = [mid for mid in index if target in mid or mid in target]
-    if subs:
-        return index[min(subs, key=len)]
+    cands = []
+    for mid in index:
+        if not mid:
+            continue
+        if target.startswith(mid) and target[len(mid)] in MODEL_BOUNDARY:
+            cands.append((0, -len(mid), mid))  # 目录 id ⊂ 本机名：取最长
+        elif mid.startswith(target) and mid[len(target)] in MODEL_BOUNDARY:
+            cands.append((1, len(mid), mid))   # 本机名 ⊂ 目录 id：取最短
+    if cands:
+        return index[min(cands)[2]]
     return None
 
 
@@ -338,9 +423,21 @@ def _window_label(minutes):
     return f"{minutes} 分钟窗口"
 
 
-def _period_used(records, agent, span):
-    """某 Agent 在当前滚动周期内采集到的 tokens 合计（含缓存，按天粒度）。"""
-    from_day = (date.today() - timedelta(days=max(0, -(-span // 86400)) - 1)).isoformat()
+def _period_used(records, agent, span, peers=None):
+    """某 Agent 在当前滚动周期内的 tokens 合计（含缓存）。
+
+    span 不足一天时按**真正的滚动窗口**统计：用分钟桶从 now-span 起算。早先这里一律
+    按自然日截断，5 小时窗口实际统计的是「今天 00:00 至今」，晚上查看会把十几个小时的
+    用量算进 5 小时窗口，严重高估。分钟桶只来自自动采集，手动录入的记录没有时刻，
+    无法参与滚动窗口统计。
+    span ≥ 一天时仍按自然日统计；此时 records 在 sync 模式下已含对端数据。
+    """
+    if span < 86400:
+        start = time.time() - span
+        local = collector.minutes_usage_since(collector.load_minutes(DATA_DIR), start, agent=agent)
+        remote = sync.peer_usage_since(peers or [], start, agent=agent)
+        return sum(local[f] + remote[f] for f in ("input", "output", "cached"))
+    from_day = (date.today() - timedelta(days=span // 86400 - 1)).isoformat()
     return sum(r.get("input", 0) + r.get("output", 0) + r.get("cached", 0)
                for r in records if r.get("agent") == agent and r.get("date", "") >= from_day)
 
@@ -354,90 +451,164 @@ def _save_cal(d):
     storage.save_json(CAL_FILE, d, indent=1)
 
 
-def _calibrated_quota(agent_kind, window):
-    """跨设备校准的窗口总额估算，返回 (quota, carried)。
+def _cal_key(agent_kind, window):
+    """校准状态在 quota_cal.json 里的键，同时也是前端开关按钮传回来的标识。"""
+    return f"{agent_kind}|{window.get('label')}"
+
+
+def _calibrated_quota(key, window):
+    """窗口总额估算，返回 (quota, carried)。
 
     两条估算路径：
-    1) 差分（优先）：同一窗口内 本机用量增量 ÷ 官方百分比增量 —— 只需观察区间内的
-       本地数据，新设备/换设备也能快速校准，不依赖 git 同步历史；
-    2) 时点（兜底）：本机窗口实测 ÷ 官方百分比 —— 需要本机日志覆盖整个窗口。
-    新估算低于旧值 70% 时判定为日志不全，沿用旧校准（carried=True）；
-    超过一个完整窗口仍未恢复才接受新值。
+    1) 差分（优先）：同一窗口内 实测用量增量 ÷ 官方百分比增量 —— 只需观察区间内的
+       数据，换设备后也能快速重新锚定，不依赖历史同步；
+    2) 时点（兜底）：窗口实测 ÷ 官方百分比 —— 需要日志覆盖整个窗口。
+    新估算低于旧值 70% 时判定为日志不全，沿用旧校准（carried=True，UI 显示「沿用上次
+    校准值」）；超过一个完整窗口仍未恢复才接受新值。
+
+    st["manual"] 为真表示用户手动点过「开始估计」：此时**只认差分路径**。手动重启的
+    语义就是「从这一刻起重新锚定」，而时点法会把重启之前那段用量一起除进去 —— 那段
+    正是用户判断为不干净（别的设备也在跑、日志缺了一截）才要重来的，不能再用。
+    代价是重启后要等官方百分比涨 1% 才出得来数，UI 会显示「正在校准」。
+
+    前提：实测用量必须与官方百分比同口径。官方百分比是**账号级**的，所以只有单机使用、
+    或多端已开启 sync 合并时，这里算出来的绝对额度才可信。多端未合并时调用方会跳过
+    本函数（见 _estimate_window 的 hide_absolute），而不是给出一个按本机占比缩水的数。
     """
     mins = int(window.get("window_minutes") or 0)
     pct = float(window.get("used_percent") or 0)
     measured = window.get("measured_tokens") or 0
     resets_at = window.get("resets_at")
-    key = f"{agent_kind}|{window.get('label')}"
     now = time.time()
     span = mins * 60 if mins else 7 * 86400
-    cal = _load_cal()
-    st = cal.get(key) or {}
-    changed = False
+    with _cal_lock:
+        cal = _load_cal()
+        st = cal.get(key) or {}
+        changed = False
 
-    # 差分锚点：窗口重置，或实测倒退（说明换了设备/日志被清）时重新锚定
-    anchor = st.get("anchor") or {}
-    if anchor.get("resets_at") != resets_at or measured < int(anchor.get("measured") or 0):
-        anchor = {"resets_at": resets_at, "pct": pct, "measured": measured}
-        st["anchor"] = anchor
-        changed = True
+        # 差分锚点：窗口重置，或实测倒退（说明换了设备/日志被清）时重新锚定
+        anchor = st.get("anchor") or {}
+        if anchor.get("resets_at") != resets_at or measured < int(anchor.get("measured") or 0):
+            anchor = {"resets_at": resets_at, "pct": pct, "measured": measured}
+            st["anchor"] = anchor
+            changed = True
 
-    q_delta = None
-    d_pct = pct - float(anchor.get("pct") or 0)
-    d_used = measured - int(anchor.get("measured") or 0)
-    if d_pct >= 1 and d_used > 0:
-        q_delta = round(d_used / d_pct * 100)
+        q_delta = None
+        d_pct = pct - float(anchor.get("pct") or 0)
+        d_used = measured - int(anchor.get("measured") or 0)
+        if d_pct >= 1 and d_used > 0:
+            q_delta = round(d_used / d_pct * 100)
 
-    q_point = round(measured * 100 / pct) if 0 < pct < 100 and measured > 0 else None
-    q_cand = q_delta or q_point
+        q_point = None
+        if not st.get("manual") and 0 < pct < 100 and measured > 0:
+            q_point = round(measured * 100 / pct)
+        q_cand = q_delta or q_point
 
-    q_old = st.get("quota")
-    if q_cand and (not q_old or q_cand >= 0.7 * q_old or now - st.get("updated", 0) > span):
-        st["quota"] = q_cand
-        st["updated"] = int(now)
-        changed = True
-        q_out, carried = q_cand, False
-    elif q_old:
-        q_out, carried = q_old, True
-    else:
-        q_out, carried = q_cand, False
-    if changed:
-        cal[key] = st
-        _save_cal(cal)
+        q_old = st.get("quota")
+        if q_cand and (not q_old or q_cand >= 0.7 * q_old or now - st.get("updated", 0) > span):
+            st["quota"] = q_cand
+            st["updated"] = int(now)
+            changed = True
+            q_out, carried = q_cand, False
+        elif q_old:
+            q_out, carried = q_old, True
+        else:
+            q_out, carried = q_cand, False
+        if changed:
+            cal[key] = st
+            _save_cal(cal)
     return q_out, carried
 
 
-def _estimate_window(agent_kind, window):
-    """给官方窗口补本机实测 tokens，并按跨设备校准值估算总额/剩余。"""
+def set_estimation(key, enabled):
+    """开关某个窗口的额度估计，返回该窗口的新校准状态。
+
+    开启 = 从此刻重新锚定：整条校准记录清空重建（manual=True），旧的 quota / anchor
+    一并丢掉。多端环境下前一段观测可能混了别的设备的数据，留着反而把新估算带偏。
+    关闭 = 只留官方百分比与重置时间，不再输出任何绝对 token 数。
+    """
+    with _cal_lock:
+        cal = _load_cal()
+        cal[key] = ({"enabled": True, "manual": True, "started_at": int(time.time())}
+                    if enabled else {"enabled": False})
+        _save_cal(cal)
+        return cal[key]
+
+
+def _estimate_window(agent_kind, window, peers=None, hide_absolute=False):
+    """给官方窗口补实测 tokens，并按校准值估算总额/剩余。
+
+    实测 = 本机原始日志（事件级精确）+ 各对端分钟桶（误差 < 60s）。只有当实测覆盖
+    整个账号时，除以官方百分比得到的绝对额度才有意义；hide_absolute 为真时只保留
+    百分比与实测量，不输出会误导人的绝对值。
+
+    用户也可以自己关掉某个窗口的估计（est_enabled=False）—— 多端场景下这台机器的
+    观测口径未必干净，与其看一个不知道偏了多少的数，不如只看官方百分比。
+    """
     mins = int(window.get("window_minutes") or 0)
     resets_at = window.get("resets_at")
     start = (resets_at - mins * 60) if (resets_at and mins) else time.time() - mins * 60
     used = collector.usage_since(agent_kind, start) or {}
-    measured = used.get("input", 0) + used.get("output", 0) + used.get("cached", 0)
-    window["measured_tokens"] = measured
-    q, carried = _calibrated_quota(agent_kind, window)
+    local = used.get("input", 0) + used.get("output", 0) + used.get("cached", 0)
+    remote_parts = sync.peer_usage_since(peers or [], start, kind=agent_kind)
+    remote = remote_parts["input"] + remote_parts["output"] + remote_parts["cached"]
+    window["measured_local"] = local
+    window["measured_remote"] = remote
+    window["measured_tokens"] = local + remote
+    window["account_wide"] = bool(peers)
+
+    key = _cal_key(agent_kind, window)
+    st = _load_cal().get(key) or {}
+    enabled = bool(st.get("enabled", True))  # 没设置过的默认开启，保持既有行为
+    # 这些键必须每次全部重写：Kimi 的卡片有 120s 内存缓存，window 是被复用的同一个
+    # dict，分支里漏写的键会留着上一轮的值（停止估计后再开启，UI 仍显示「已停止」）
+    window.update({
+        "cal_key": key,
+        "est_enabled": enabled,
+        "est_since": st.get("started_at"),
+        "est_quota": None,
+        "est_remaining": None,
+        "est_carried": False,
+        "est_calibrating": False,
+        "absolute_hidden": hide_absolute,
+        "est_paused": not enabled and not hide_absolute,
+    })
+    if hide_absolute or not enabled:
+        return window
+    q, carried = _calibrated_quota(key, window)
     pct = float(window.get("used_percent") or 0)
     window["est_quota"] = q
     window["est_remaining"] = round(q * (1 - pct / 100)) if q else None
     window["est_carried"] = carried
+    # 手动重启后差分还没攒够数据：区别于「压根没数据」，UI 要说清在等什么
+    window["est_calibrating"] = bool(st.get("manual") and not q)
     return window
 
 
 def compute_plans():
     """汇总 Plan 用量：Kimi/Codex 读官方数据并估算剩余；手动配额按采集数据统计。"""
     now = time.time()
-    result = {"auto": [], "manual": [], "now": now}
+    settings = load_settings()
+    peers = active_peers(settings)
+    # 多端但没合并数据时，任何由本机日志换算出的绝对 token 数都会按本机用量占比缩水
+    hide = settings["multi_device"] == "local_only"
+    result = {
+        "auto": [], "manual": [], "now": now,
+        "multi_device": settings["multi_device"],
+        "peers": [{"device_name": p["device_name"], "updated": p["updated"], "stale": p["stale"]}
+                  for p in peers],
+    }
 
-    # Kimi：官方接口实时查询（百分比 + 重置时间），失败时展示错误提示
+    # Kimi：官方接口实时查询（百分比 + 重置时间，账号级，多端下同样准确）
     kimi_card = quota.query_kimi()
     if not kimi_card.get("error"):
         for w in kimi_card.get("windows", []):
-            _estimate_window("kimi", w)
+            _estimate_window("kimi", w, peers, hide)
         kimi_card["note"] = "官方接口 · 实时"
     result["auto"].append(kimi_card)
 
-    # Codex：本地日志里的官方 rate_limits
-    rl = collector.latest_rate_limits()
+    # Codex：官方 rate_limits 快照，多端时取各设备中最新的一份
+    rl, rl_source = sync.newest_rate_limits(collector.latest_rate_limits(), peers)
     if rl:
         limits = rl["rate_limits"]
         windows = []
@@ -451,36 +622,46 @@ def compute_plans():
                 "used_percent": float(w.get("used_percent") or 0),
                 "resets_at": w.get("resets_at"),
                 "window_minutes": mins,
-            }))
+            }, peers, hide))
         result["auto"].append({
             "agent": "Codex CLI",
             "plan_type": limits.get("plan_type") or "unknown",
             "updated": rl.get("timestamp"),
-            "note": "官方限额 · 来自本地日志",
+            "note": f"官方限额 · 来自 {rl_source} 的日志" if rl_source else "官方限额 · 来自本地日志",
+            "snapshot_device": rl_source,
             "windows": windows,
         })
 
-    records, _ = merged_records()
+    records, _ = merged_records(settings)
     for p in load_plans():
         label, span = PLAN_PERIODS.get(p.get("period"), PLAN_PERIODS["week"])
-        used = _period_used(records, p.get("agent"), span)
-        item = {**p, "period_label": label, "used": used}
+        used = _period_used(records, p.get("agent"), span, peers)
+        item = {**p, "period_label": label, "used": used,
+                "account_wide": settings["multi_device"] != "local_only"}
         if p.get("mode") == "percent":
             # 百分比锚定：录入时的实测用量 ÷ 录入的百分比 ≈ 总额度，之后随采集数据自动推算
+            # 多端未合并时 est_quota 会缩水，但 used 与 est_quota 同为本机口径，误差在
+            # 百分比上互相抵消 —— 所以百分比仍可用，只隐藏绝对值。
             anchor_pct = float(p.get("anchor_pct") or 0)
             anchor_used = int(p.get("anchor_used") or 0)
             est_quota = round(anchor_used * 100 / anchor_pct) if 0 < anchor_pct < 100 and anchor_used > 0 else None
-            item["est_quota"] = est_quota
             if est_quota:
                 item["pct"] = round(min(100.0, used / est_quota * 100), 1)
                 item["remaining"] = max(0, est_quota - used)
             else:
                 item["pct"] = round(anchor_pct, 1)
                 item["remaining"] = None
+            item["est_quota"] = est_quota
+            if hide:
+                item["est_quota"] = item["remaining"] = None
+                item["absolute_hidden"] = True
         else:
+            # 固定配额：quota 是账号级的，used 在多端未合并时只有本机 ——
+            # 这会低估已用、高估剩余，是唯一朝危险方向偏的路径，必须显式告警。
             quota_tokens = max(1, int(p.get("quota") or 1))
             item["pct"] = round(min(100.0, used / quota_tokens * 100), 1)
             item["remaining"] = max(0, quota_tokens - used)
+            item["understated"] = hide
         result["manual"].append(item)
     return result
 
@@ -580,7 +761,7 @@ class Handler(BaseHTTPRequestHandler):
                 hour = int(hour) if hour != "" else None
                 if not day:
                     raise ValueError("day 不能为空")
-                rows = collector.breakdown(day, hour)
+                rows = timeline_rows(day, hour)
             except (ValueError, TypeError):
                 self._send_json({"error": "day/hour 参数不合法"}, 400)
                 return
@@ -592,6 +773,11 @@ class Handler(BaseHTTPRequestHandler):
             prices = load_prices(DATA_DIR)
             records, _ = merged_records()
             self._send_json({"prices": prices, "unpriced": unpriced_models(records, prices)})
+        elif path == "/api/ping":
+            # 单实例检测用：新进程靠它确认端口上跑的是不是另一个 TokenLens
+            self._send_json({"app": APP_ID, "pid": os.getpid()})
+        elif path == "/api/settings":
+            self._send_json(settings_payload())
         elif path.startswith("/static/"):
             rel = path[len("/static/"):]
             full = os.path.normpath(os.path.join(STATIC_DIR, rel))
@@ -609,11 +795,67 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/api/collect":
             try:
-                summary = collector.collect_once(DATA_DIR)
+                summary, shared = collect_and_share()
             except Exception as e:  # 采集失败不影响主程序
                 self._send_json({"error": str(e)}, 500)
                 return
-            self._send_json({"ok": True, "summary": summary})
+            self._send_json({"ok": True, "summary": summary, "shared": shared})
+            return
+        if url.path == "/api/settings":
+            payload = self._read_json()
+            if payload is None:
+                return
+            s = load_settings()
+            mode = payload.get("multi_device", s["multi_device"])
+            if mode not in MULTI_MODES:
+                self._send_json({"error": "multi_device 取值不合法"}, 400)
+                return
+            sync_dir = str(payload.get("sync_dir", s["sync_dir"]) or "").strip()
+            if mode == "sync":
+                if not sync_dir:
+                    self._send_json({"error": "选择「多端合并」需要填写共享目录"}, 400)
+                    return
+                # 立刻验证目录可写，别等到后台采集时才静默失败
+                try:
+                    os.makedirs(sync_dir, exist_ok=True)
+                    probe = os.path.join(sync_dir, ".tokenlens-write-test")
+                    with open(probe, "w", encoding="utf-8") as f:
+                        f.write("ok")
+                    os.remove(probe)
+                except OSError as e:
+                    self._send_json({"error": f"共享目录不可写：{e}"}, 400)
+                    return
+            if payload.get("device_name"):
+                sync.rename_device(DATA_DIR, payload["device_name"])
+            save_settings({"multi_device": mode, "sync_dir": sync_dir})
+            shared = None
+            if mode == "sync":
+                try:
+                    shared = sync.export(DATA_DIR, sync_dir)
+                except OSError as e:
+                    self._send_json({"error": f"写入共享目录失败：{e}"}, 400)
+                    return
+            self._send_json({"ok": True, "shared": shared, **settings_payload()})
+            return
+        if url.path == "/api/collect/rebuild":
+            try:
+                summary, backups = rebuild_collection()
+            except Exception as e:
+                self._send_json({"error": f"重建失败：{e}"}, 500)
+                return
+            self._send_json({"ok": True, "summary": summary, "backups": backups})
+            return
+        if url.path == "/api/quota/estimate":
+            payload = self._read_json()
+            if payload is None:
+                return
+            key = str(payload.get("key", "")).strip()
+            if not key or "|" not in key or len(key) > 200:
+                self._send_json({"error": "key 不合法"}, 400)
+                return
+            enabled = bool(payload.get("enabled"))
+            state = set_estimation(key, enabled)
+            self._send_json({"ok": True, "key": key, **state})
             return
         if url.path == "/api/prices/import":
             try:
@@ -673,9 +915,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "百分比需在 0-100 之间"}, 400)
                     return
                 # 锚定：记录录入时的实测周期用量，之后随采集数据自动推算剩余
-                records, _ = merged_records()
+                st = load_settings()
+                peers = active_peers(st)
+                records, _ = merged_records(st)
                 plan["anchor_pct"] = pct
-                plan["anchor_used"] = _period_used(records, agent, PLAN_PERIODS[period][1])
+                plan["anchor_used"] = _period_used(records, agent, PLAN_PERIODS[period][1], peers)
                 plan["anchor_at"] = int(time.time())
             else:
                 try:
@@ -736,6 +980,7 @@ class Handler(BaseHTTPRequestHandler):
             "date": day,
             "agent": str(payload["agent"]).strip(),
             "model": model,
+            "project": str(payload.get("project", "")).strip()[:60] or collector.UNKNOWN_PROJECT,
             "requests": to_int(payload.get("requests")) or 1,
             "input": input_t,
             "output": output_t,
@@ -789,29 +1034,171 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True})
 
 
+def collect_and_share():
+    """采集一次；sync 模式下顺带把本机结果写进共享目录。返回采集摘要。
+
+    导出失败（网盘未挂载、目录被删）不影响采集本身，只在返回值里带上错误。
+    _collect_lock 让后台定时线程、手动「同步本地数据」、时间线的按需采集三者互斥，
+    否则会同时读改写 offsets / auto_usage，互相覆盖导致漏扫或重扫。
+    """
+    global _last_collect_at
+    with _collect_lock:
+        summary = collector.collect_once(DATA_DIR)
+        _last_collect_at = time.time()
+    s = load_settings()
+    shared = None
+    if s["multi_device"] == "sync" and s["sync_dir"]:
+        try:
+            shared = sync.export(DATA_DIR, s["sync_dir"])
+        except OSError as e:
+            shared = f"导出失败：{e}"
+    return summary, shared
+
+
+def rebuild_collection():
+    """清空采集状态并全量重扫一遍本机日志，返回 (采集摘要, 备份文件名列表)。
+
+    什么时候需要：采集状态出过问题（漏扫、重复计数），或者想让升级前采集的老数据
+    补上新增的维度（比如项目名）—— 旧数据里没有的字段，只能靠重扫原始日志补回来。
+
+    三个文件不是删除而是改名备份：万一某个工具的日志已经被它自己清理掉了，
+    重扫会比原来少一截，留着备份至少还能捞回来。手动录入的记录存在另一个文件，不受影响。
+    """
+    stamp = int(time.time())
+    backups = []
+    with _collect_lock:
+        for name in (collector.STATE_FILE, collector.AUTO_FILE, collector.MINUTES_FILE):
+            path = os.path.join(DATA_DIR, name)
+            if not os.path.exists(path):
+                continue
+            backup = f"{path}.bak-{stamp}"
+            try:
+                os.replace(path, backup)
+                backups.append(os.path.basename(backup))
+            except OSError:
+                pass
+        summary = collector.collect_once(DATA_DIR)
+    global _last_collect_at
+    _last_collect_at = time.time()
+    s = load_settings()
+    if s["multi_device"] == "sync" and s["sync_dir"]:
+        try:
+            sync.export(DATA_DIR, s["sync_dir"])
+        except OSError:
+            pass  # 导出失败不影响重建本身
+    return summary, backups
+
+
+def collect_if_stale():
+    """距上次采集超过 COLLECT_FRESH_WINDOW 就先增量采集一次。
+
+    时间线走分钟桶快路径，而分钟桶只在采集时更新；后台采集是 10 分钟一次，
+    直接查表会看不到最近几分钟的用量。增量采集只读日志新增的尾部，很便宜。
+    """
+    if time.time() - _last_collect_at < COLLECT_FRESH_WINDOW:
+        return
+    try:
+        collect_and_share()
+    except Exception:
+        pass  # 采集失败不该让时间线整个报错，用已有的桶先渲染
+
+
+def timeline_rows(day, hour=None):
+    """明细时间线：优先用分钟桶（快），覆盖不到的日期回退为重扫原始日志。"""
+    collect_if_stale()
+    rows = collector.breakdown_from_minutes(collector.load_minutes(DATA_DIR), day, hour)
+    return rows if rows is not None else collector.breakdown(day, hour)
+
+
 def collect_loop():
     """启动后立即采集一次，之后定时增量扫描。"""
     while True:
         try:
-            collector.collect_once(DATA_DIR)
+            collect_and_share()
         except Exception:
             pass
         time.sleep(COLLECT_INTERVAL)
 
 
-def find_free_port(preferred):
+def _port_free(port):
     s = socket.socket()
     try:
-        s.bind(("127.0.0.1", preferred))
-        return preferred
+        s.bind(("127.0.0.1", port))
+        return True
     except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def find_free_port(preferred):
+    """优先用 preferred，被占则让系统分配一个。"""
+    if _port_free(preferred):
+        return preferred
+    s = socket.socket()
+    try:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
     finally:
         s.close()
 
 
+def probe_instance(port, timeout=1.5):
+    """端口上跑的是另一个 TokenLens 就返回它的 /api/ping 响应，否则 None。"""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/ping",
+                                     headers={"Host": f"127.0.0.1:{port}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    return d if isinstance(d, dict) and d.get("app") == APP_ID else None
+
+
+def running_instance():
+    """已有实例在跑就返回 {'port': ...}，否则 None。
+
+    双开会让两个进程共用同一份 collector_state.json 与 auto_usage.json，而 _lock
+    只是线程锁不跨进程，交错读改写 offsets 会漏扫或重复计数 —— 所以这里必须拦住。
+    先查 instance.json 记的端口（上次可能没抢到默认端口），再兜底查默认端口。
+    """
+    ports = []
+    d = storage.load_json(INSTANCE_FILE, {})
+    if isinstance(d, dict) and isinstance(d.get("port"), int):
+        ports.append(d["port"])
+    if DEFAULT_PORT not in ports:
+        ports.append(DEFAULT_PORT)
+    for p in ports:
+        if probe_instance(p):
+            return {"port": p}
+    return None
+
+
+def _write_instance(port):
+    try:
+        storage.save_json(INSTANCE_FILE, {"port": port, "pid": os.getpid(),
+                                          "started_at": int(time.time())})
+    except OSError:
+        pass  # 记不上只是退化成「只探默认端口」，不该拦住启动
+
+
+def _clear_instance():
+    try:
+        os.remove(INSTANCE_FILE)
+    except OSError:
+        pass
+
+
 def main():
+    running = running_instance()
+    if running:
+        # 已经有一个在跑：打开它的界面，别再起第二个采集进程
+        import webbrowser
+        url = f"http://127.0.0.1:{running['port']}"
+        print(f"TokenLens 已在运行，已为你打开 {url}")
+        webbrowser.open(url)
+        return
+
     if "--demo" in sys.argv:
         seed_demo_data()
         print("已生成演示数据")
@@ -819,19 +1206,32 @@ def main():
     load_records()  # 确保数据文件存在
     threading.Thread(target=collect_loop, daemon=True).start()
 
-    port = find_free_port(8399)
+    port = find_free_port(DEFAULT_PORT)
     url = f"http://127.0.0.1:{port}"
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    _write_instance(port)
+    try:
+        _run_ui(server, url)
+    finally:
+        _clear_instance()
 
+
+def _run_ui(server, url):
     try:
         import webview
-        webview.create_window("TokenLens", url, width=1440, height=900, min_size=(1100, 700))
-        webview.start()  # 窗口关闭后返回
-        server.shutdown()
-        return
     except ImportError:
-        pass
+        webview = None
+    if webview is not None:
+        try:
+            webview.create_window("TokenLens", url, width=1440, height=900, min_size=(1100, 700))
+            webview.start()  # 窗口关闭后返回
+            server.shutdown()
+            return
+        except Exception as e:
+            # 装了 pywebview 但底层 WebView2 / GTK 运行时缺失时 start() 会抛，
+            # 这类失败不该让整个程序崩掉，退回浏览器照样能用
+            print(f"原生窗口启动失败（{e}），改用浏览器打开")
 
     # 无 pywebview 时回退为浏览器打开
     import webbrowser

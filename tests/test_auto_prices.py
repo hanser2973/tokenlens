@@ -116,10 +116,30 @@ class MatchModelTest(unittest.TestCase):
         index = {"gpt-5.2": {"input": 1.75, "output": 14.0}}
         self.assertEqual(server.match_model(index, "gpt-5.2"), {"input": 1.75, "output": 14.0})
 
-    def test_substring_picks_shortest(self):
+    def test_our_name_is_prefix_of_catalog_picks_shortest(self):
+        """本机名 ⊂ 目录 id：目录里全是更具体的变体，取最接近基础款的那个。"""
         index = {"gpt-5.2-mini": {"input": 0.4, "output": 1.6},
                  "gpt-5.2-mini-2026": {"input": 0.5, "output": 2.0}}
         self.assertEqual(server.match_model(index, "gpt-5.2"), {"input": 0.4, "output": 1.6})
+
+    def test_catalog_id_is_prefix_of_our_name_picks_longest(self):
+        """目录 id ⊂ 本机名（带日期的快照版）：取最长即最贴近的系列。"""
+        index = {"gpt-5": {"input": 1.25, "output": 10.0},
+                 "gpt-5-mini": {"input": 0.25, "output": 2.0}}
+        self.assertEqual(server.match_model(index, "gpt-5-mini-2025-08-07"),
+                         {"input": 0.25, "output": 2.0})
+
+    def test_short_id_does_not_hijack(self):
+        """回归：'k2' 曾以「最短子串」抢走 'kimi-k2.7-code-turbo'，配成错系列的价。"""
+        index = {"k2": {"input": 0.6, "output": 2.5},
+                 "kimi-k2.7-code": {"input": 0.95, "output": 4.0}}
+        self.assertEqual(server.match_model(index, "kimi-k2.7-code-turbo"),
+                         {"input": 0.95, "output": 4.0})
+
+    def test_no_boundary_no_match(self):
+        """只在分隔符处对齐才算匹配，宁可不定价也不要配错价。"""
+        index = {"gpt-5": {"input": 1.25, "output": 10.0}}
+        self.assertIsNone(server.match_model(index, "gpt-52"))
 
     def test_no_match(self):
         self.assertIsNone(server.match_model({"a": {"input": 1, "output": 1}}, "zzz"))
