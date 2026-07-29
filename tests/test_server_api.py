@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """HTTP 层安全与输入校验测试：Host/Origin 校验、静态目录防穿越、请求体上限、date 校验、原子存储。"""
+import base64
 import json
 import os
 import socket
@@ -112,6 +113,67 @@ class ApiTest(unittest.TestCase):
         recs = server.load_records()
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["source"], "manual")
+
+    # ---------- 背景壁纸 ----------
+    # 端点直接落盘二进制，必须挡住非图片内容，别把 data/ 变成任意写入口
+
+    def raw(self, path, method="GET", headers=None, body=None):
+        """壁纸 GET 返回的是图片，不能按 JSON 解析，单独走一个原始版本。"""
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
+                                   method=method, headers=headers or {}, data=body)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, resp.headers.get("Content-Type"), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type"), e.read()
+
+    @staticmethod
+    def _jpeg():
+        return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 32 + b"\xff\xd9"
+
+    def _put_wallpaper(self, raw_bytes):
+        body = json.dumps({"data": base64.b64encode(raw_bytes).decode()}).encode()
+        return self.req("/api/wallpaper", method="POST", body=body,
+                        headers={"Content-Type": "application/json"})
+
+    def test_wallpaper_roundtrip(self):
+        self.addCleanup(lambda: self.req("/api/wallpaper", method="DELETE"))
+        status, data = self._put_wallpaper(self._jpeg())
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertTrue(os.path.exists(server.wallpaper_path()))
+
+        status, ctype, body = self.raw("/api/wallpaper")
+        self.assertEqual(status, 200)
+        self.assertEqual(ctype, "image/jpeg")
+        self.assertEqual(body, self._jpeg())
+
+        status, _ = self.req("/api/wallpaper", method="DELETE")
+        self.assertEqual(status, 200)
+        self.assertFalse(os.path.exists(server.wallpaper_path()))
+        self.assertEqual(self.raw("/api/wallpaper")[0], 404)
+
+    def test_wallpaper_rejects_non_jpeg(self):
+        status, data = self._put_wallpaper(b"<?php system($_GET[0]); ?>")
+        self.assertEqual(status, 400)
+        self.assertIn("JPEG", data["error"])
+        self.assertFalse(os.path.exists(server.wallpaper_path()))
+
+    def test_wallpaper_rejects_bad_base64(self):
+        body = json.dumps({"data": "not base64!!"}).encode()
+        status, _ = self.req("/api/wallpaper", method="POST", body=body,
+                             headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+
+    def test_wallpaper_delete_is_idempotent(self):
+        self.assertEqual(self.req("/api/wallpaper", method="DELETE")[0], 200)
+
+    def test_wallpaper_foreign_origin_rejected(self):
+        body = json.dumps({"data": base64.b64encode(self._jpeg()).decode()}).encode()
+        status, _ = self.req("/api/wallpaper", method="POST", body=body,
+                             headers={"Origin": "https://evil.com",
+                                      "Content-Type": "application/json"})
+        self.assertEqual(status, 403)
 
     # ---------- 单实例检测 ----------
     # 双开会让两个进程共用同一份 collector_state.json，交错读改写 offsets 导致漏扫/重复计数

@@ -8,6 +8,8 @@
 <script src="/static/vendor/echarts.min.js"></script>
 </head>
 <body>
+<!-- 背景壁纸图层：图片由 /api/wallpaper 提供，暗度/模糊由外观面板写成 CSS 变量 -->
+<div class="wallpaper" id="wallpaper"></div>
 <div class="app">
 
   <!-- 侧边栏 -->
@@ -41,6 +43,7 @@
     </nav>
     <div class="sidebar-foot">
       <button class="btn-ghost" id="btn-sync">⟳ 同步本地数据</button>
+      <button class="btn-ghost" id="btn-skin">✦ 外观</button>
       <button class="btn-primary" id="btn-add">＋ 录入数据</button>
       <label class="auto-sync"><input type="checkbox" id="chk-auto-sync"> 自动同步
         <select class="select" id="sel-sync-interval">
@@ -360,6 +363,57 @@
       <div class="form-tip">订阅制模型为官方 API 参考价，仅供估算，不代表真实扣费。保存后历史记录费用会按新价格重算。</div>
       <button type="submit" class="btn-primary wide">保存价格</button>
     </form>
+  </div>
+</div>
+
+<!-- 外观设置弹窗 -->
+<div class="modal-mask" id="skin-modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">外观</div>
+      <button class="icon-btn" id="skin-modal-close">✕</button>
+    </div>
+    <div class="form">
+      <div class="form-row">
+        <label>背景壁纸</label>
+        <div class="skin-preview" id="skin-preview">还没有设置壁纸<br>选一张本地图片作为全站背景</div>
+      </div>
+      <div class="skin-actions">
+        <button class="btn-ghost" id="skin-pick">选择图片…</button>
+        <button class="btn-ghost" id="skin-clear">移除壁纸</button>
+      </div>
+      <input type="file" id="skin-file" accept="image/*" hidden>
+      <div class="skin-row">
+        <label>压暗</label>
+        <input type="range" id="skin-dim" min="0" max="92" step="1">
+        <span class="skin-val" id="skin-dim-val"></span>
+      </div>
+      <div class="skin-row">
+        <label>模糊</label>
+        <input type="range" id="skin-blur" min="0" max="24" step="1">
+        <span class="skin-val" id="skin-blur-val"></span>
+      </div>
+      <div class="skin-row">
+        <label title="卡片和侧栏的透明度：调高能看见壁纸，调低文字对比更强">通透度</label>
+        <input type="range" id="skin-sheer" min="0" max="100" step="1">
+        <span class="skin-val" id="skin-sheer-val"></span>
+      </div>
+      <div class="form-row">
+        <label>主题色</label>
+        <div class="skin-accents" id="skin-accents">
+          <button class="skin-accent" data-accent="default">
+            <i style="background:linear-gradient(90deg,#7c5cff,#00d4ff)"></i>星紫
+          </button>
+          <button class="skin-accent" data-accent="miku">
+            <i style="background:linear-gradient(90deg,#39c5bb,#ff6bb5)"></i>初音
+          </button>
+          <button class="skin-accent" data-accent="sakura">
+            <i style="background:linear-gradient(90deg,#ff7eb6,#b48bff)"></i>樱
+          </button>
+        </div>
+      </div>
+      <div class="form-tip" id="skin-tip">图片会压缩后存在本机 data/ 目录，不上传任何地方。压暗和模糊只作用于背景；通透度调的是卡片和侧栏的透明度——调高更能看见壁纸，调低文字对比更强。</div>
+    </div>
   </div>
 </div>
 

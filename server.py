@@ -5,6 +5,7 @@ TokenLens · AI / Agent Token 消耗统计看板
 - 也可手动录入数据
 - 优先以原生窗口运行（pywebview），不可用时回退为浏览器打开
 """
+import base64
 import json
 import os
 import random
@@ -120,9 +121,34 @@ CONTENT_TYPES = {
     ".js": "application/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
 }
+
+
+def wallpaper_path():
+    """背景壁纸落在数据目录，跟着 data/ 一起被 .gitignore 忽略。"""
+    return os.path.join(DATA_DIR, "wallpaper.jpg")
+
+
+def save_wallpaper(b64):
+    """存壁纸。前端已在 canvas 里压成 JPEG，这里只认 JPEG 魔数，避免写入任意内容。"""
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise ValueError("图片数据不合法")
+    if not raw.startswith(b"\xff\xd8\xff"):
+        raise ValueError("只接受 JPEG 数据")
+    path = wallpaper_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, path)
+    return len(raw)
 
 
 def load_settings():
@@ -721,7 +747,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path):
+    def _send_file(self, path, cache=None):
         ext = os.path.splitext(path)[1].lower()
         ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
         try:
@@ -733,6 +759,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if cache:
+            self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
@@ -778,6 +806,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"app": APP_ID, "pid": os.getpid()})
         elif path == "/api/settings":
             self._send_json(settings_payload())
+        elif path == "/api/wallpaper":
+            wp = wallpaper_path()
+            if not os.path.exists(wp):
+                self._send_json({"error": "no wallpaper"}, 404)
+                return
+            # 换图后路径不变，必须禁缓存否则页面还显示旧图
+            self._send_file(wp, cache="no-store")
         elif path.startswith("/static/"):
             rel = path[len("/static/"):]
             full = os.path.normpath(os.path.join(STATIC_DIR, rel))
@@ -800,6 +835,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
                 return
             self._send_json({"ok": True, "summary": summary, "shared": shared})
+            return
+        if url.path == "/api/wallpaper":
+            payload = self._read_json()
+            if payload is None:
+                return
+            try:
+                size = save_wallpaper(payload.get("data") or "")
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            except OSError as e:
+                self._send_json({"error": f"保存失败：{e}"}, 500)
+                return
+            self._send_json({"ok": True, "bytes": size})
             return
         if url.path == "/api/settings":
             payload = self._read_json()
@@ -998,6 +1047,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "forbidden"}, 403)
             return
         url = urlparse(self.path)
+        if url.path == "/api/wallpaper":
+            try:
+                os.remove(wallpaper_path())
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                self._send_json({"error": f"删除失败：{e}"}, 500)
+                return
+            self._send_json({"ok": True})
+            return
         if url.path == "/api/plans":
             qs = parse_qs(url.query)
             try:

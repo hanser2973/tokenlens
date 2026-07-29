@@ -166,9 +166,15 @@
     return inst;
   }
 
+  /* 图表文字画在 canvas 上，拿不到 CSS 的描边阴影；卡片背后又直接是壁纸，
+     比 DOM 小字更容易被花色背景吃掉，所以统一亮一档并自带投影 */
+  const CHART_LABEL = {
+    color: "#aab3c7", fontSize: 11,
+    textShadowColor: "rgba(0,0,0,0.55)", textShadowBlur: 3,
+  };
   const AXIS_STYLE = {
     axisLine: { lineStyle: { color: "rgba(255,255,255,0.12)" } },
-    axisLabel: { color: "#8b93a7", fontSize: 11 },
+    axisLabel: { ...CHART_LABEL },
     splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
   };
   const TOOLTIP_STYLE = {
@@ -219,7 +225,7 @@
     chartOf($("#chart-trend")).setOption({
       backgroundColor: "transparent",
       tooltip: { trigger: "axis", ...TOOLTIP_STYLE, valueFormatter: (v) => state.metric === "cost" ? fmtCost(v) : fmtFull(v) },
-      legend: { textStyle: { color: "#8b93a7", fontSize: 11 }, icon: "roundRect", itemWidth: 12, itemHeight: 6, top: 0 },
+      legend: { textStyle: { ...CHART_LABEL }, icon: "roundRect", itemWidth: 12, itemHeight: 6, top: 0 },
       grid: { left: 8, right: 12, top: 34, bottom: 4, containLabel: true },
       xAxis: {
         type: "category", data: labels, boundaryGap: false,
@@ -302,7 +308,7 @@
         trigger: "item", ...TOOLTIP_STYLE,
         formatter: (p) => `${p.name}<br/>${fmtFull(p.value)} tokens (${p.percent}%)`,
       },
-      legend: { orient: "vertical", right: 4, top: "middle", textStyle: { color: "#8b93a7", fontSize: 11 }, icon: "circle", itemWidth: 8 },
+      legend: { orient: "vertical", right: 4, top: "middle", textStyle: { ...CHART_LABEL }, icon: "circle", itemWidth: 8 },
       series: [{
         type: "pie",
         radius: ["58%", "80%"],
@@ -323,7 +329,7 @@
     chartOf($("#chart-agent-bar")).setOption({
       backgroundColor: "transparent",
       tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, ...TOOLTIP_STYLE, valueFormatter: fmtFull },
-      legend: { textStyle: { color: "#8b93a7", fontSize: 11 }, icon: "roundRect", itemWidth: 12, itemHeight: 6, top: 0 },
+      legend: { textStyle: { ...CHART_LABEL }, icon: "roundRect", itemWidth: 12, itemHeight: 6, top: 0 },
       grid: { left: 8, right: 12, top: 30, bottom: 4, containLabel: true },
       xAxis: { type: "category", data: agg.map((a) => a.name), axisLine: AXIS_STYLE.axisLine, axisLabel: { ...AXIS_STYLE.axisLabel, interval: 0, rotate: agg.length > 5 ? 18 : 0 }, axisTick: { show: false } },
       yAxis: { type: "value", axisLabel: { ...AXIS_STYLE.axisLabel, formatter: fmtNum }, splitLine: AXIS_STYLE.splitLine },
@@ -925,6 +931,156 @@
     box.innerHTML = cards.join("");
   }
 
+  /* ---------- 外观（壁纸 / 主题色） ----------
+     壁纸图片存在服务端 data/wallpaper.jpg（多端各存各的），压暗、模糊、主题色
+     属于「这台机器上看着舒服」的偏好，放 localStorage 即可，不进同步数据。 */
+  const SKIN_KEY = "tokenlens.skin";
+  const SKIN_DEFAULT = { dim: 36, blur: 0, sheer: 60, accent: "default" };
+  const skin = (() => {
+    try { return { ...SKIN_DEFAULT, ...(JSON.parse(localStorage.getItem(SKIN_KEY)) || {}) }; }
+    catch (e) { return { ...SKIN_DEFAULT }; }
+  })();
+  let wallpaperUrl = "";
+
+  function applySkin(persist) {
+    const root = document.documentElement;
+    root.dataset.accent = skin.accent;
+    root.style.setProperty("--wp-dim", (skin.dim / 100).toFixed(2));
+    root.style.setProperty("--wp-blur", skin.blur + "px");
+    root.style.setProperty("--sheer", (skin.sheer / 100).toFixed(2));
+    if (persist) { try { localStorage.setItem(SKIN_KEY, JSON.stringify(skin)); } catch (e) { /* 无痕模式忽略 */ } }
+  }
+
+  /* 探测壁纸是否存在：GET 404 时让 --wp-image 归零，背景回落到纯色 */
+  function refreshWallpaper() {
+    const url = "/api/wallpaper?t=" + Date.now();
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = url;
+    }).then((ok) => {
+      wallpaperUrl = ok ? url : "";
+      document.documentElement.style.setProperty("--wp-image", ok ? `url("${url}")` : "none");
+      syncSkinPreview();
+    });
+  }
+
+  /* 服务端 JSON 体上限 1 MB，所以在浏览器里先缩到 1920px 再逐档降质量塞进预算 */
+  const B64_BUDGET = 960000;
+  function compressImage(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("读取文件失败"));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error("不是浏览器能识别的图片格式"));
+        img.onload = () => {
+          const scale = Math.min(1, 1920 / Math.max(img.width, img.height));
+          const cv = document.createElement("canvas");
+          cv.width = Math.max(1, Math.round(img.width * scale));
+          cv.height = Math.max(1, Math.round(img.height * scale));
+          cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+          let data = "";
+          for (let q = 0.86; q >= 0.3; q -= 0.12) {
+            data = cv.toDataURL("image/jpeg", q).split(",")[1] || "";
+            if (data.length <= B64_BUDGET) { resolve(data); return; }
+          }
+          reject(new Error("图片太大，换一张分辨率低一些的"));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function syncSkinPreview() {
+    const el = $("#skin-preview");
+    if (!el) return;
+    el.style.backgroundImage = wallpaperUrl ? `url("${wallpaperUrl}")` : "";
+    el.classList.toggle("has-image", !!wallpaperUrl);
+    $("#skin-clear").disabled = !wallpaperUrl;
+    // 压暗/模糊/通透度都只作用在壁纸上，没图时全部置灰
+    ["#skin-dim", "#skin-blur", "#skin-sheer"].forEach((s) => { $(s).disabled = !wallpaperUrl; });
+  }
+
+  function syncSkinUI() {
+    $("#skin-dim").value = skin.dim;
+    $("#skin-blur").value = skin.blur;
+    $("#skin-sheer").value = skin.sheer;
+    $("#skin-dim-val").textContent = skin.dim + "%";
+    $("#skin-blur-val").textContent = skin.blur + "px";
+    $("#skin-sheer-val").textContent = skin.sheer + "%";
+    $$("#skin-accents .skin-accent").forEach((b) =>
+      b.classList.toggle("active", b.dataset.accent === skin.accent));
+    syncSkinPreview();
+  }
+
+  function bindSkin() {
+    const mask = $("#skin-modal-mask");
+    const close = () => mask.classList.remove("show");
+    $("#btn-skin").addEventListener("click", () => { syncSkinUI(); mask.classList.add("show"); });
+    $("#skin-modal-close").addEventListener("click", close);
+    mask.addEventListener("click", (e) => { if (e.target === mask) close(); });
+
+    $("#skin-pick").addEventListener("click", () => $("#skin-file").click());
+    $("#skin-file").addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = "";  // 同一张图再选一次也要能触发 change
+      if (!file) return;
+      const tip = $("#skin-tip");
+      const old = tip.textContent;
+      tip.textContent = "正在压缩并保存…";
+      try {
+        const data = await compressImage(file);
+        const res = await fetch("/api/wallpaper", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ data }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(out.error || "保存失败");
+        await refreshWallpaper();
+        toast("壁纸已设置");
+      } catch (err) {
+        toast(err.message || "设置壁纸失败");
+      } finally {
+        tip.textContent = old;
+      }
+    });
+
+    $("#skin-clear").addEventListener("click", async () => {
+      const res = await fetch("/api/wallpaper", { method: "DELETE" });
+      if (!res.ok) { toast("移除失败"); return; }
+      await refreshWallpaper();
+      toast("已移除壁纸");
+    });
+
+    $("#skin-dim").addEventListener("input", (e) => {
+      skin.dim = +e.target.value;
+      $("#skin-dim-val").textContent = skin.dim + "%";
+      applySkin(true);
+    });
+    $("#skin-blur").addEventListener("input", (e) => {
+      skin.blur = +e.target.value;
+      $("#skin-blur-val").textContent = skin.blur + "px";
+      applySkin(true);
+    });
+    $("#skin-sheer").addEventListener("input", (e) => {
+      skin.sheer = +e.target.value;
+      $("#skin-sheer-val").textContent = skin.sheer + "%";
+      applySkin(true);
+    });
+    $("#skin-accents").addEventListener("click", (e) => {
+      const btn = e.target.closest(".skin-accent");
+      if (!btn) return;
+      skin.accent = btn.dataset.accent;
+      applySkin(true);
+      syncSkinUI();
+    });
+    return close;
+  }
+
   /* ---------- 事件绑定 ---------- */
   function bind() {
     $$(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
@@ -1233,7 +1389,8 @@
       }
     });
 
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); closePlanModal(); closePriceModal(); closeMultiModal(); } });
+    const closeSkinModal = bindSkin();
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeModal(); closePlanModal(); closePriceModal(); closeMultiModal(); closeSkinModal(); } });
 
     const f = $("#add-form");
     f.addEventListener("submit", submitForm);
@@ -1247,6 +1404,8 @@
   }
 
   /* ---------- 启动 ---------- */
+  applySkin(false);
+  refreshWallpaper();
   bind();
   loadData().then(() => {
     const h = location.hash.slice(1);
