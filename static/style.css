@@ -71,7 +71,9 @@ html[data-wallpaper="on"] {
   --surface: rgba(13, 18, 33, calc(0.74 - var(--sheer) * 0.40));
   --surface-hover: rgba(22, 29, 49, calc(0.86 - var(--sheer) * 0.38));
   --panel: rgba(8, 11, 20, calc(0.88 - var(--sheer) * 0.36));
-  --topbar-bg: rgba(9, 12, 21, calc(0.92 - var(--sheer) * 0.32));
+  /* 顶栏原来压到 0.92 起步，是全站最实的一层，挂了壁纸就成了屏幕顶上一条黑带。
+     降到和卡片同一档，靠下面那条 backdrop-filter 保证滚动内容不会从底下透出来。 */
+  --topbar-bg: rgba(9, 12, 21, calc(0.70 - var(--sheer) * 0.34));
   --line: rgba(255, 255, 255, 0.11);
   /* 卡片变透后背后就不再是恒定深色，次要文字得整体提一档才压得住亮处 */
   --text-dim: #a9b2c6;
@@ -85,6 +87,7 @@ html[data-wallpaper="on"] .entity-sub,
 html[data-wallpaper="on"] .es-label,
 html[data-wallpaper="on"] .ds-label,
 html[data-wallpaper="on"] .plan-sub,
+html[data-wallpaper="on"] .plan-cap,
 html[data-wallpaper="on"] .rank-val,
 html[data-wallpaper="on"] .foot-tip {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
@@ -131,8 +134,10 @@ body {
 }
 .wallpaper::after {
   content: ""; position: absolute; inset: 0;
+  /* 顶部这一档原来压 0.35，和顶栏自己那层叠在一起是双重压暗，屏幕最上面一条就黑了。
+     顶栏现在自带毛玻璃，遮罩这里只需要收一点点边，压深留给底部（图表压着的地方）。 */
   background:
-    linear-gradient(180deg, rgba(7,10,17,0.35), rgba(7,10,17,0.12) 30%, rgba(7,10,17,0.45)),
+    linear-gradient(180deg, rgba(7,10,17,0.14), rgba(7,10,17,0.10) 30%, rgba(7,10,17,0.45)),
     rgba(7, 10, 17, var(--wp-dim));
 }
 
@@ -219,6 +224,10 @@ body::before {
   backdrop-filter: saturate(150%);
   border-bottom: 1px solid var(--line);
 }
+/* 顶栏是全站唯一该上背光模糊的地方：它是 sticky 的，内容会从它底下滚过去。
+   卡片不敢用 blur 是怕把背后的壁纸糊掉（见文件头），而顶栏只盖着屏幕最上面一条，
+   糊成毛玻璃反倒是想要的效果 —— 既透出壁纸的颜色，滚过去的内容又不会看着像重影。 */
+html[data-wallpaper="on"] .topbar { backdrop-filter: blur(16px) saturate(150%); }
 .page-title { font-size: 19px; font-weight: 700; letter-spacing: 0.2px; }
 .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
@@ -582,6 +591,23 @@ td.dim { color: var(--text-faint); }
 .plan-bar { height: 7px; border-radius: 99px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
 .plan-bar i { display: block; height: 100%; border-radius: 99px; transition: width 0.5s var(--ease); }
 .plan-sub { margin-top: 9px; font-size: 12px; color: var(--text-faint); line-height: 1.65; }
+
+/* 真实容量：整轮实测出来的数，和上面几行的估算不是一回事，单独一行并框起来区分 */
+.plan-cap {
+  margin-top: 7px; padding: 6px 10px; border-radius: var(--r-sm);
+  font-size: 12px; line-height: 1.6; color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04); border: 1px dashed var(--line);
+}
+.plan-cap.ok {
+  color: var(--ok); background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+}
+.plan-cap b { font-weight: 600; }
+/* 账号哈希：跟在账号名后面的小标记，弱化成等宽小字，别抢正文 */
+.acc-hash {
+  margin-left: 5px; font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px; opacity: 0.7;
+}
 
 /* 多端状态提示条：警告态强调「绝对值不可信」，正常态说明合并了哪些设备 */
 .multi-note {

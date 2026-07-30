@@ -8,8 +8,12 @@
 - 每台设备只写自己的 tokenlens-<device_id>.json、只读其他设备的文件，天然没有写冲突，
   也就不需要合并算法。任何把远端目录映射成本地目录的方案（OneDrive / 坚果云 /
   Syncthing / SMB 共享）都能直接用，不引入额外依赖。
-- 导出内容只有 日期|Agent|模型 的聚合数值和分钟桶，不含文件路径、项目名等本机隐私，
+- 导出内容只有 日期|Agent|模型 的聚合数值、分钟桶，以及各工具登录账号的哈希
+  （identity.account_hash，反推不回邮箱/uuid），不含文件路径、项目名等本机隐私，
   因此放进网盘也不会泄露工作内容。
+- 设备 id 是每台机器随机生成的，识别不出「这两台是同一个账号」。账号哈希补上了这一层：
+  配额相关的汇总只取同账号的对端（peers_for_kind），否则官方那个账号级的百分比会
+  和混了别人用量的实测值相除，估出来的额度直接失真。
 
 不适用的情况：如果两台机器之间同步的是 AI 工具自身的日志目录（如把 ~/.claude 也放进
 网盘），两边会扫到同一批事件，汇总后重复计数。这种情况请不要开启多端合并。
@@ -20,6 +24,7 @@ import time
 import uuid
 
 import collector
+import identity
 import storage
 
 DEVICE_FILE = "device.json"
@@ -56,6 +61,9 @@ def export(data_dir, sync_dir):
         "updated": int(time.time()),
         "days": storage.load_json(os.path.join(data_dir, collector.AUTO_FILE), {}),
         "minutes": collector.load_minutes(data_dir),
+        # 各工具登录账号的哈希（不可反推）：对端据此判断我们是不是同一个账号。
+        # 官方百分比是账号级的，混进别的账号的用量会让额度估算凭空缩水。
+        "accounts": identity.local_hashes(data_dir),
         # Codex 的官方限额只存在于本机日志快照里，另一台机器用完后本机是看不到的。
         # 一并导出，让各端都能取到全账号最新的那一份。
         "rate_limits": collector.latest_rate_limits(),
@@ -96,8 +104,51 @@ def read_peers(data_dir, sync_dir):
             "days": d.get("days") if isinstance(d.get("days"), dict) else {},
             "minutes": d.get("minutes") if isinstance(d.get("minutes"), dict) else {},
             "rate_limits": d.get("rate_limits") if isinstance(d.get("rate_limits"), dict) else None,
+            "accounts": d.get("accounts") if isinstance(d.get("accounts"), dict) else {},
         })
     return peers
+
+
+def peers_for_kind(peers, kind, account_hash):
+    """挑出与本机同账号的对端，返回 (可用对端, 未标账号的设备名, 别的账号的设备名)。
+
+    三种情况分开处理：
+    - 账号对得上 → 用。
+    - 对端没报账号（老版本 TokenLens，或那台机器没装这个工具）→ 也用，保持既有行为，
+      但把设备名回报给界面，让用户知道这部分没验证过。
+    - 报了但对不上 → 必须剔除。官方百分比是账号级的，把别人的用量加进分子，
+      「实测 ÷ 百分比」估出来的额度会成倍缩水，真实容量更是直接算错。
+
+    本机账号未知（account_hash 为空）时无从比较，一律放行、不报为「其他账号」——
+    多端面板会另外提示本机读不到账号标识，这里不重复告警。
+    """
+    same, unknown, other = [], [], []
+    for p in peers:
+        h = (p.get("accounts") or {}).get(kind)
+        if not h:
+            unknown.append(p)
+        elif not account_hash or h == account_hash:
+            same.append(p)
+        else:
+            other.append(p)
+    return (same + unknown,
+            [p["device_name"] for p in unknown],
+            [p["device_name"] for p in other])
+
+
+def peers_coverage_start(peers):
+    """各对端分钟桶都覆盖到的最早日期 'YYYY-MM-DD'；有对端没数据返回 None。
+
+    真实容量要求整轮窗口的实测口径完整：只要有一台设备的分钟桶起点晚于窗口起点，
+    这一轮就少数了一截，不能当成真实容量。
+    """
+    starts = []
+    for p in peers:
+        cov = collector.minutes_coverage_start(p.get("minutes") or {})
+        if cov is None:
+            return None
+        starts.append(cov)
+    return max(starts) if starts else None
 
 
 def newest_rate_limits(local, peers):

@@ -18,7 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 
+import capacity
 import collector
+import identity
 import quota
 import storage
 import sync
@@ -174,11 +176,15 @@ def settings_payload():
     s = load_settings()
     ident = sync.device_identity(DATA_DIR)
     peers = active_peers(s)
+    accounts = identity.display_accounts(DATA_DIR)
+    hashes = {a["kind"]: a["hash"] for a in accounts}
     return {
         **s,
         "device": ident,
+        "accounts": accounts,
         "peers": [{"device_name": p["device_name"], "device_id": p["device_id"],
-                   "updated": p["updated"], "stale": p["stale"], "days": len(p["days"])}
+                   "updated": p["updated"], "stale": p["stale"], "days": len(p["days"]),
+                   "accounts": _peer_account_match(p, hashes)}
                   for p in peers],
     }
 
@@ -461,11 +467,24 @@ def _period_used(records, agent, span, peers=None):
     if span < 86400:
         start = time.time() - span
         local = collector.minutes_usage_since(collector.load_minutes(DATA_DIR), start, agent=agent)
-        remote = sync.peer_usage_since(peers or [], start, agent=agent)
+        remote = sync.peer_usage_since(peers_for_agent(peers, agent), start, agent=agent)
         return sum(local[f] + remote[f] for f in ("input", "output", "cached"))
     from_day = (date.today() - timedelta(days=span // 86400 - 1)).isoformat()
     return sum(r.get("input", 0) + r.get("output", 0) + r.get("cached", 0)
                for r in records if r.get("agent") == agent and r.get("date", "") >= from_day)
+
+
+def peers_for_agent(peers, agent):
+    """按该 Agent 所属工具的登录账号过滤对端。
+
+    识别不出工具（手动录入的 Agent）或本机拿不到账号时原样返回 —— 见
+    sync.peers_for_kind：「不知道」要放行，只有「确认不是同一个账号」才剔除。
+    """
+    kind = collector.kind_for_agent(agent)
+    if not kind or not peers:
+        return peers or []
+    kept, _, _ = sync.peers_for_kind(peers, kind, identity.local_hashes(DATA_DIR).get(kind))
+    return kept
 
 
 def _load_cal():
@@ -561,12 +580,35 @@ def set_estimation(key, enabled):
         return cal[key]
 
 
-def _estimate_window(agent_kind, window, peers=None, hide_absolute=False):
-    """给官方窗口补实测 tokens，并按校准值估算总额/剩余。
+def _capacity_coverage(start, peers, hide_absolute):
+    """这一轮窗口的实测口径能不能当真实容量用，返回 (可用, 不可用的原因)。
+
+    真实容量是「数出来的」而不是外推的，所以对口径的要求比估算更硬：少数了一截，
+    得到的就是一个偏小的假容量，而它看起来和真值一样可信。
+
+    刻意不跟「停止估计」联动：那个开关关的是外推 —— 用户往往正是因为外推值不可信
+    才关掉它，而真实容量恰好是外推的替代品。它自己的前提（整轮从满额观测、对端覆盖
+    到窗口起点、账号一致）比那个开关严格得多，不需要再借它把关。
+    """
+    if hide_absolute:
+        return False, "多端未同步，实测只有本机"
+    if peers:
+        cov = sync.peers_coverage_start(peers)
+        if cov is None or cov > date.fromtimestamp(start).isoformat():
+            return False, "其他设备的采集数据没覆盖到窗口起点"
+    return True, ""
+
+
+def _estimate_window(agent_kind, window, peers=None, hide_absolute=False,
+                     account=None, plan_type=None):
+    """给官方窗口补实测 tokens，估算总额/剩余，并记一次真实容量观测。
 
     实测 = 本机原始日志（事件级精确）+ 各对端分钟桶（误差 < 60s）。只有当实测覆盖
     整个账号时，除以官方百分比得到的绝对额度才有意义；hide_absolute 为真时只保留
     百分比与实测量，不输出会误导人的绝对值。
+
+    对端先按账号过滤（account 是本机该工具的账号哈希）：官方百分比是账号级的，
+    另一个账号的设备写进同一个共享目录时，它的用量必须排除在分子之外。
 
     用户也可以自己关掉某个窗口的估计（est_enabled=False）—— 多端场景下这台机器的
     观测口径未必干净，与其看一个不知道偏了多少的数，不如只看官方百分比。
@@ -574,14 +616,17 @@ def _estimate_window(agent_kind, window, peers=None, hide_absolute=False):
     mins = int(window.get("window_minutes") or 0)
     resets_at = window.get("resets_at")
     start = (resets_at - mins * 60) if (resets_at and mins) else time.time() - mins * 60
+    counted, unverified, other_account = sync.peers_for_kind(peers or [], agent_kind, account)
     used = collector.usage_since(agent_kind, start) or {}
     local = used.get("input", 0) + used.get("output", 0) + used.get("cached", 0)
-    remote_parts = sync.peer_usage_since(peers or [], start, kind=agent_kind)
+    remote_parts = sync.peer_usage_since(counted, start, kind=agent_kind)
     remote = remote_parts["input"] + remote_parts["output"] + remote_parts["cached"]
     window["measured_local"] = local
     window["measured_remote"] = remote
     window["measured_tokens"] = local + remote
-    window["account_wide"] = bool(peers)
+    window["account_wide"] = bool(counted)
+    window["peers_other_account"] = other_account   # 账号对不上，已排除
+    window["peers_unverified"] = unverified         # 没报账号（老版本），仍计入
 
     key = _cal_key(agent_kind, window)
     st = _load_cal().get(key) or {}
@@ -599,6 +644,12 @@ def _estimate_window(agent_kind, window, peers=None, hide_absolute=False):
         "absolute_hidden": hide_absolute,
         "est_paused": not enabled and not hide_absolute,
     })
+
+    # 真实容量：这一轮窗口从满额跑到用完，实际消耗了多少 token（见 capacity.py）
+    covered, blocked = _capacity_coverage(start, counted, hide_absolute)
+    window["real_capacity"] = capacity.observe(DATA_DIR, key, window, covered=covered,
+                                               blocked=blocked, account=account,
+                                               plan_type=plan_type)
     if hide_absolute or not enabled:
         return window
     q, carried = _calibrated_quota(key, window)
@@ -611,6 +662,15 @@ def _estimate_window(agent_kind, window, peers=None, hide_absolute=False):
     return window
 
 
+def _peer_account_match(peer, local_hashes):
+    """对端各工具的账号与本机是否一致：same / other / unknown。"""
+    out = {}
+    for kind, h in (peer.get("accounts") or {}).items():
+        mine = local_hashes.get(kind)
+        out[kind] = "unknown" if not mine else ("same" if h == mine else "other")
+    return out
+
+
 def compute_plans():
     """汇总 Plan 用量：Kimi/Codex 读官方数据并估算剩余；手动配额按采集数据统计。"""
     now = time.time()
@@ -618,23 +678,35 @@ def compute_plans():
     peers = active_peers(settings)
     # 多端但没合并数据时，任何由本机日志换算出的绝对 token 数都会按本机用量占比缩水
     hide = settings["multi_device"] == "local_only"
+    accounts = identity.local_accounts(DATA_DIR)
     result = {
         "auto": [], "manual": [], "now": now,
         "multi_device": settings["multi_device"],
-        "peers": [{"device_name": p["device_name"], "updated": p["updated"], "stale": p["stale"]}
+        "peers": [{"device_name": p["device_name"], "updated": p["updated"], "stale": p["stale"],
+                   "accounts": _peer_account_match(p, {k: v["hash"] for k, v in accounts.items()})}
                   for p in peers],
+        "accounts": identity.display_accounts(DATA_DIR),
     }
 
     # Kimi：官方接口实时查询（百分比 + 重置时间，账号级，多端下同样准确）
     kimi_card = quota.query_kimi()
     if not kimi_card.get("error"):
+        # 账号唯一 id 只有这个接口给得出，缓存下来给多端匹配用（identity.py）
+        if kimi_card.get("account_id"):
+            identity.remember(DATA_DIR, "kimi", kimi_card["account_id"])
+            accounts = identity.local_accounts(DATA_DIR)
+            result["accounts"] = identity.display_accounts(DATA_DIR)
         for w in kimi_card.get("windows", []):
-            _estimate_window("kimi", w, peers, hide)
+            _estimate_window("kimi", w, peers, hide,
+                             account=(accounts.get("kimi") or {}).get("hash"),
+                             plan_type=kimi_card.get("plan_type"))
         kimi_card["note"] = "官方接口 · 实时"
     result["auto"].append(kimi_card)
 
     # Codex：官方 rate_limits 快照，多端时取各设备中最新的一份
-    rl, rl_source = sync.newest_rate_limits(collector.latest_rate_limits(), peers)
+    codex_hash = (accounts.get("codex") or {}).get("hash")
+    codex_peers, _, _ = sync.peers_for_kind(peers, "codex", codex_hash)
+    rl, rl_source = sync.newest_rate_limits(collector.latest_rate_limits(), codex_peers)
     if rl:
         limits = rl["rate_limits"]
         windows = []
@@ -648,7 +720,7 @@ def compute_plans():
                 "used_percent": float(w.get("used_percent") or 0),
                 "resets_at": w.get("resets_at"),
                 "window_minutes": mins,
-            }, peers, hide))
+            }, peers, hide, account=codex_hash, plan_type=limits.get("plan_type")))
         result["auto"].append({
             "agent": "Codex CLI",
             "plan_type": limits.get("plan_type") or "unknown",
@@ -1170,10 +1242,16 @@ def timeline_rows(day, hour=None):
 
 
 def collect_loop():
-    """启动后立即采集一次，之后定时增量扫描。"""
+    """启动后立即采集一次，之后定时增量扫描，顺带记一次配额观测。"""
     while True:
         try:
             collect_and_share()
+        except Exception:
+            pass
+        try:
+            # 真实容量要求「从满额一路看到用完」，只在用户打开配额页时才观测是接不上的：
+            # 窗口可能在半夜重置、在没开界面时跑满。跟着采集一起走，10 分钟一个观测点。
+            compute_plans()
         except Exception:
             pass
         time.sleep(COLLECT_INTERVAL)

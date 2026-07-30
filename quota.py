@@ -7,7 +7,9 @@
   （client_id 取自 kimi-code 开源仓库 packages/oauth/src/constants.ts）
 
 注意：接口只返回百分比与重置时间，不返回绝对 token 额度；绝对额度由
-collector.usage_since 实测值 ÷ 百分比估算。结果带 120s 内存缓存。
+collector.usage_since 实测值 ÷ 百分比估算（真实容量另见 capacity.py）。
+响应里的 user.userId 是账号唯一 id，交给 identity.py 做多端账号匹配。
+结果带 120s 内存缓存。
 """
 import json
 import os
@@ -83,12 +85,31 @@ def _access_token():
     return cred["access_token"], None
 
 
-def _pct(used, limit):
+def _num(v):
     try:
-        u, l = float(used), float(limit)
+        return float(v)
     except (TypeError, ValueError):
+        return None
+
+
+def _pct(detail):
+    """从一段额度明细里算已用百分比。
+
+    接口按 proto3 的习惯省略零值字段：没用过的窗口只给 {limit, remaining}，
+    用满的窗口只给 {limit, used}。所以两条路都要认 —— 只看 used 的话，
+    「有 remaining 没 used」会被当成 0%，真实容量的整轮观测会从错误的起点开始。
+    """
+    detail = detail or {}
+    limit = _num(detail.get("limit"))
+    if not limit or limit <= 0:
         return 0.0
-    return round(u / l * 100, 1) if l > 0 else 0.0
+    used = _num(detail.get("used"))
+    if used is None:
+        remaining = _num(detail.get("remaining"))
+        if remaining is None:
+            return 0.0
+        used = limit - remaining
+    return round(max(0.0, min(used / limit * 100, 100.0)), 1)
 
 
 def _iso_to_ts(s):
@@ -136,7 +157,7 @@ def query_kimi():
         mins = int(win.get("duration") or 0)
         windows.append({
             "label": _window_label(mins),
-            "used_percent": _pct(detail.get("used"), detail.get("limit")),
+            "used_percent": _pct(detail),
             "resets_at": _iso_to_ts(detail.get("resetTime")),
             "window_minutes": mins,
         })
@@ -144,14 +165,17 @@ def query_kimi():
     if usage:
         windows.append({
             "label": "每周窗口",
-            "used_percent": _pct(usage.get("used"), usage.get("limit")),
+            "used_percent": _pct(usage),
             "resets_at": _iso_to_ts(usage.get("resetTime")),
             "window_minutes": 10080,
         })
 
-    level = ((body.get("user") or {}).get("membership") or {}).get("level") or ""
+    user = body.get("user") or {}
+    level = (user.get("membership") or {}).get("level") or ""
     card = {
         "agent": "Kimi Code",
+        # 账号唯一 id：多端汇总时用来确认各设备是不是同一个账号（见 identity.py）
+        "account_id": str(user.get("userId") or "") or None,
         "plan_type": level.replace("LEVEL_", "") or "unknown",
         "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "windows": windows,

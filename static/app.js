@@ -22,7 +22,7 @@
     trendGran: "day", // day | hour | minute（趋势图时间粒度）
     trendDate: "",
     trendHour: 0,
-    settings: { multi_device: "off", sync_dir: "", device: {}, peers: [] },
+    settings: { multi_device: "off", sync_dir: "", device: {}, peers: [], accounts: [] },
   };
 
   // 多端模式说明：off 单机；local_only 多端未同步（官方百分比仍准，绝对 token 数不可信）；
@@ -807,8 +807,9 @@
     return `${parts}后重置`;
   }
 
-  /* actions：窗口右上角的操作区 HTML（目前只有额度估计开关），手动配额不传 */
-  function planWinHtml(pct, title, sub, actions) {
+  /* actions：窗口右上角的操作区 HTML（目前只有额度估计开关），手动配额不传
+     cap：真实容量那一行，单独一行是因为它和上面几行不是一个性质 —— 上面是估算，它是实测 */
+  function planWinHtml(pct, title, sub, actions, cap) {
     pct = Math.min(100, pct);
     return `
       <div class="plan-win">
@@ -818,7 +819,31 @@
         </div>
         <div class="plan-bar"><i style="width:${pct}%;background:${planColor(pct)}"></i></div>
         <div class="plan-sub">${sub}</div>
+        ${cap || ""}
       </div>`;
+  }
+
+  /* 真实容量：整轮窗口从满额跑到用完，实测数出来的 token 总量（不是外推）。
+     还没跑满时显示本轮进度，口径不干净时直接说明为什么不计。 */
+  function capacityHtml(w) {
+    const rc = w.real_capacity;
+    if (!rc) return "";
+    const t = rc.tracking || {};
+    if (rc.tokens) {
+      const parts = [`<b>真实容量 ${fmtNum(rc.tokens)}</b> tokens`];
+      if (rc.samples > 1) parts.push(`实测 ${rc.samples} 轮 · 均值 ${fmtNum(rc.avg)} · ${fmtNum(rc.min)}~${fmtNum(rc.max)}`);
+      else parts.push(`${fmtAgo(rc.at)}实测跑满一轮`);
+      const pct = Math.min(100, w.used_percent || 0);
+      if (!w.absolute_hidden) parts.push(`按此算剩余 ≈ ${fmtNum(Math.round(rc.tokens * (1 - pct / 100)))}`);
+      if (t.eligible && !t.sampled) parts.push(`本轮已记 ${fmtNum(t.tokens || 0)}`);
+      return `<div class="plan-cap ok">${parts.join(" · ")}</div>`;
+    }
+    if (t.eligible) {
+      return `<div class="plan-cap">真实容量测量中：本轮从满额开始已记 ${fmtNum(t.tokens || 0)} tokens（${t.pct || 0}%），跑到 100% 就出数</div>`;
+    }
+    // 本轮不算数，但已经数到的量仍然有参考价值（尤其周窗口，等一个干净周期要一周）
+    const so_far = t.tokens ? `　本轮至今已记 ${fmtNum(t.tokens)} tokens（${t.pct || 0}%，只作参考）` : "";
+    return `<div class="plan-cap">真实容量：本轮不计 —— ${esc(t.blocked || "还没观测到这个窗口")}${so_far}</div>`;
   }
 
   /* 额度估计开关：多端时本机观测口径未必干净，让用户自己决定何时锚定、何时干脆不看 */
@@ -850,9 +875,22 @@
     }
     const peers = data.peers || [];
     const list = peers.length
-      ? peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}${p.stale ? " · 可能已离线" : ""}）`).join("、")
+      ? peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}${p.stale ? " · 可能已离线" : ""}${accountTag(p)}）`).join("、")
       : "还没读到其他设备的数据 —— 确认另一台也已开启合并并指向同一个目录";
-    box.innerHTML = `<div class="multi-note ok">⇄ 多端合并已开启 · 其他设备：${list}</div>`;
+    let html = `<div class="multi-note ok">⇄ 多端合并已开启 · 其他设备：${list}</div>`;
+    const foreign = peers.filter((p) => Object.values(p.accounts || {}).includes("other"));
+    if (foreign.length) {
+      html += `<div class="multi-note warn">⚠ ${foreign.map((p) => esc(p.device_name)).join("、")} 登录的是别的账号：用量仍计入总览，但配额窗口的实测与真实容量已把它排除（官方百分比是按账号算的）。</div>`;
+    }
+    box.innerHTML = html;
+  }
+
+  /* 对端账号与本机的一致性：只在「不一样」时出声，一致是常态不用刷屏 */
+  function accountTag(p) {
+    const vals = Object.values(p.accounts || {});
+    if (!vals.length) return " · 未报账号";
+    if (vals.includes("other")) return " · 其他账号";
+    return vals.includes("same") ? " · 同账号" : "";
   }
 
   async function renderPlans() {
@@ -894,7 +932,12 @@
         } else {
           subs.push("暂无足够数据估算绝对额度");
         }
-        return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "), estToggleHtml(w));
+        // 账号对不上的设备已被剔出实测口径，必须说一声，否则用户会奇怪为什么少了一台
+        if ((w.peers_other_account || []).length) {
+          subs.push(`已排除 ${w.peers_other_account.length} 台其他账号的设备`);
+        }
+        return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "),
+                           estToggleHtml(w), capacityHtml(w));
       }).join("");
       const updated = (a.updated || "").replace("T", " ").slice(5, 16);
       cards.push(`
@@ -961,6 +1004,10 @@
       img.src = url;
     }).then((ok) => {
       wallpaperUrl = ok ? url : "";
+      // 挂上壁纸必须同时打这个标记：style.css 里「表面改深色压深 + 通透度可调 +
+      // 小字加描边」整套样式全挂在 html[data-wallpaper="on"] 上。少了它，图是出来了，
+      // 但顶栏还是那层近乎不透明的深色（屏幕顶上一条黑带），通透度滑块也完全不起作用。
+      document.documentElement.dataset.wallpaper = ok ? "on" : "off";
       document.documentElement.style.setProperty("--wp-image", ok ? `url("${url}")` : "none");
       syncSkinPreview();
     });
@@ -1188,9 +1235,15 @@
     function renderMultiPeers(s) {
       const peers = s.peers || [];
       const self = `本机：${esc(s.device?.name || "未命名")}`;
-      $("#multi-peers").innerHTML = s.multi_device === "sync"
-        ? `<div class="form-tip">${self}；读到 ${peers.length} 台其他设备${peers.length ? "：" + peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}，${p.days} 条日聚合）`).join("、") : ""}</div>`
-        : `<div class="form-tip">${self}</div>`;
+      const accounts = s.accounts || [];
+      // 设备 id 是随机的，认不出「这两台是同一个人」；账号哈希才是多端汇总的依据
+      const acc = accounts.length
+        ? `<div class="form-tip">本机登录的账号：${accounts.map((a) => `${esc(a.agent)} · ${esc(a.label)}<span class="acc-hash">#${esc(a.short)}</span>`).join("　")}<br>
+             只有 <b>#哈希</b> 会写进共享目录（反推不回邮箱和 id），用来确认各设备是不是同一个账号。</div>`
+        : `<div class="form-tip">还没读到任何账号标识（各工具都没登录，或凭证文件不在默认位置）：多端汇总会退回按设备合并，配额估算可能混入别的账号。</div>`;
+      $("#multi-peers").innerHTML = acc + (s.multi_device === "sync"
+        ? `<div class="form-tip">${self}；读到 ${peers.length} 台其他设备${peers.length ? "：" + peers.map((p) => `${esc(p.device_name)}（${fmtAgo(p.updated)}，${p.days} 条日聚合${accountTag(p)}）`).join("、") : ""}</div>`
+        : `<div class="form-tip">${self}</div>`);
     }
     async function openMultiModal() {
       try {
