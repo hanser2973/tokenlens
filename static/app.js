@@ -643,7 +643,9 @@
       if (!res.ok) { toast(data.error || "同步失败"); return; }
       const parts = Object.entries(data.summary || {})
         .map(([agent, s]) => `${agent}：${s.files} 个日志，新增 ${s.events} 条`);
-      toast(parts.length ? `扫描完成 ｜ ${parts.join("；")}` : "未发现本机 AI 工具日志");
+      const notes = (data.notes || []).join("；");
+      const head = parts.length ? `扫描完成 ｜ ${parts.join("；")}` : "未发现本机 AI 工具日志";
+      toast(notes ? `${head} ｜ ${notes}` : head);
       await loadData();
     } catch (e) {
       toast("同步失败");
@@ -1175,7 +1177,9 @@
         if (!res.ok) { toast(data.error || "重建失败"); return; }
         const parts = Object.entries(data.summary || {})
           .map(([agent, s]) => `${agent} ${s.events} 条`);
-        toast(parts.length ? `重建完成 ｜ ${parts.join("；")}` : "未发现本机 AI 工具日志");
+        const notes = (data.notes || []).join("；");
+        const head = parts.length ? `重建完成 ｜ ${parts.join("；")}` : "未发现本机 AI 工具日志";
+        toast(notes ? `${head} ｜ ${notes}` : head);
         await loadData();
       } catch (err) {
         toast("重建失败");

@@ -9,6 +9,7 @@
 - Kimi Code   ~/.kimi-code/sessions/*/*/agents/*/wire.jsonl   （usage.record 事件）
 - Claude Code ~/.claude/projects/*/*.jsonl                    （assistant 消息 usage）
 - Codex CLI   ~/.codex/sessions/**/rollout-*.jsonl            （token_count 事件）
+- DeepSeek Harness ~/.dsh/sessions/*/*/session.jsonl.zstd     （assistant/message 事件）
 
 只读扫描，不修改任何工具的数据。Cursor 等工具不在本地记录 token 明细，无法自动统计。
 """
@@ -17,6 +18,7 @@ import json
 import os
 import sys
 import storage
+import zstdio
 from collections import namedtuple
 from datetime import datetime, timedelta
 
@@ -175,6 +177,84 @@ def make_codex_parser(path=""):
     return parse
 
 
+DSH_HEADER_PROBE = 1 << 16  # 读文件头多少字节去找会话头（头帧压缩后只有几百字节）
+
+
+def _dsh_dir_project(path):
+    """~/.dsh/sessions/--C-code-pythoncode-my--/session-xx/session.jsonl.zstd -> my
+
+    目录名是把 cwd 的分隔符换成 '-' 压出来的，项目名自带连字符时（gpt-web-use）
+    拆不回来 —— 所以这只是读不到会话头时的兜底。
+    """
+    body = os.path.basename(os.path.dirname(os.path.dirname(str(path)))).strip("-")
+    if not body or body.startswith("_no-cwd"):
+        return UNKNOWN_PROJECT
+    return body.rsplit("-", 1)[-1] or UNKNOWN_PROJECT
+
+
+def _dsh_project(path):
+    """dsh 会话的项目名。优先读会话头里精确的 cwd，读不到才退回目录名。
+
+    会话头是文件的第一条记录（压缩时单独占一帧），而增量采集下次只会从上次的偏移
+    往后读，扫不到它 —— 所以这里每次都从文件开头单独读一小段，不依赖当前的 chunk。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(DSH_HEADER_PROBE)
+    except OSError:
+        return _dsh_dir_project(path)
+    if str(path).endswith(".zstd"):
+        head = zstdio.decode_first(head)
+    try:
+        d = json.loads(head.split(b"\n", 1)[0].decode("utf-8", errors="replace"))
+    except ValueError:
+        return _dsh_dir_project(path)
+    if isinstance(d, dict) and d.get("type") == "session" and d.get("cwd"):
+        return project_of(d["cwd"])
+    return _dsh_dir_project(path)
+
+
+def make_dsh_parser(path=""):
+    """DeepSeek Harness：assistant/message 事件的 data.usage 是这一步的实际用量，
+    模型在 data.message.source.model，time 是毫秒时间戳。
+
+    为什么不用 assistant/chunk 里的 usage 块：一次成功调用两边各记一遍，dsh 自己的
+    口径是「同一 (turn, step) 用 assistant/message 覆盖先前的 chunk 采样」。我们是
+    只往前走的增量采集，记过的数收不回来，所以直接只认 message —— 在真实会话上对过账，
+    合计与 dsh 自己 session_projcache.json 里的 tokenUsage 完全一致。代价是某一步
+    失败后重试时，失败那次的 token 不计入（dsh 的合计同样不计）。
+    """
+    project = _dsh_project(path)
+
+    def parse(line):
+        d = json.loads(line)
+        if d.get("type") != "assistant/message":
+            return None
+        data = d.get("data") or {}
+        u = data.get("usage")
+        if not isinstance(u, dict):
+            return None
+        inp = int(u.get("inputTokens") or 0)          # 已扣掉缓存命中的部分
+        out = int(u.get("outputTokens") or 0)
+        cache_r = int(u.get("cacheReadTokens") or 0)
+        cache_w = int(u.get("cacheWriteTokens") or 0)
+        if inp + out + cache_r + cache_w == 0:
+            return None
+        ts = (d.get("time") or 0) / 1000
+        if not ts:
+            return None
+        source = (data.get("message") or {}).get("source") or {}
+        return {
+            "ts": ts,
+            "project": project,
+            "model": short_model(source.get("model")),
+            "input": inp + cache_w,   # 缓存写入按输入计，与其他采集源口径一致
+            "output": out,
+            "cached": cache_r,
+        }
+    return parse
+
+
 def _cline_models(path):
     """Cline 系任务目录里的 task_metadata.json：model_usage 按时间记了用过哪些模型。
 
@@ -300,6 +380,8 @@ SNAPSHOT_PARSERS = {"cline": parse_cline_snapshot, "opencode": parse_opencode_sn
 # ---------- 采集源注册表 ----------
 # mode 决定怎么扫：
 #   jsonl    追加写的 jsonl，按字节偏移增量读（Kimi / Claude / Codex）
+#   zstd     同样是追加写、同样按字节偏移增量读，只是每批追加是一个独立 zstd 帧，
+#            读出来要先解帧（DeepSeek Harness）
 #   snapshot 整份重写的 JSON 文件，按 mtime 判断是否要重读，靠时间戳去重
 #            （Cline 系扩展的 ui_messages.json、opencode 的单条消息 JSON）
 Source = namedtuple("Source", "agent patterns kind mode")
@@ -324,6 +406,9 @@ SOURCES = [
     Source("Kimi Code",   ["~/.kimi-code/sessions/*/*/agents/*/wire.jsonl"], "kimi",   "jsonl"),
     Source("Claude Code", ["~/.claude/projects/*/*.jsonl"],                  "claude", "jsonl"),
     Source("Codex CLI",   ["~/.codex/sessions/**/rollout-*.jsonl"],          "codex",  "jsonl"),
+    # DeepSeek Harness 默认压缩存放；配置 compression: 'none' 时是同样内容的裸 jsonl
+    Source("DeepSeek Harness", ["~/.dsh/sessions/*/*/session.jsonl.zstd"], "dsh", "zstd"),
+    Source("DeepSeek Harness", ["~/.dsh/sessions/*/*/session.jsonl"],      "dsh", "jsonl"),
     # Cline 与它的两个分支共用同一套 tasks/ui_messages.json 结构
     Source("Cline",       _vscode_globalstorage("saoudrizwan.claude-dev"),     "cline", "snapshot"),
     Source("Roo Code",    _vscode_globalstorage("rooveterinaryinc.roo-cline"), "cline", "snapshot"),
@@ -352,19 +437,47 @@ def kind_for_agent(agent):
     return _AGENT_KINDS.get(agent)
 
 
+def usable(src):
+    """这个采集源现在能不能扫。zstd 存放的日志缺解压库时只能跳过，见 scan_notes()。"""
+    return src.mode != "zstd" or zstdio.available()
+
+
+def scan_notes():
+    """采集器知道、但用户在界面上看不出来的问题，返回中文提示列表；正常时为空。"""
+    notes = []
+    blocked = sorted({s.agent for s in SOURCES if not usable(s) and source_files(s)})
+    if blocked:
+        notes.append(f"{'、'.join(blocked)} 的会话日志是 zstd 压缩的，"
+                     f"本机没有解压库，已跳过；装上即可采集：pip install zstandard")
+    return notes
+
+
 def _parser_for(kind, state, path=""):
     if kind == "kimi":
         return make_kimi_parser(path)
     if kind == "claude":
         return make_claude_parser(state, path)
+    if kind == "dsh":
+        return make_dsh_parser(path)
     return make_codex_parser(path)
 
 
-def parse_chunk(src, path, chunk, state):
-    """把一个文件的字节内容解析成事件列表，屏蔽两种存放方式的差异。
+def complete_prefix(mode, chunk):
+    """chunk 里能安全消费的字节数 —— 剩下的尾巴可能是正写到一半的记录。
 
-    jsonl 逐行解析；snapshot 整份 JSON 交给对应解析器。解析失败一律当作没有事件，
-    不让某个工具的格式变动拖垮整轮采集。
+    jsonl 以最后一个换行为界；zstd 以最后一个完整帧为界（帧长度写在帧头里，
+    不解压也能算出来）。
+    """
+    if mode == "zstd":
+        return zstdio.complete_prefix(chunk)
+    return chunk.rfind(b"\n") + 1  # 没有换行时 rfind 给 -1，正好是 0
+
+
+def parse_chunk(src, path, chunk, state):
+    """把一个文件的字节内容解析成事件列表，屏蔽几种存放方式的差异。
+
+    jsonl 逐行解析；zstd 先解帧再逐行解析；snapshot 整份 JSON 交给对应解析器。
+    解析失败一律当作没有事件，不让某个工具的格式变动拖垮整轮采集。
     """
     if src.mode == "snapshot":
         parser = SNAPSHOT_PARSERS.get(src.kind)
@@ -374,6 +487,8 @@ def parse_chunk(src, path, chunk, state):
             return parser(json.loads(chunk.decode("utf-8", errors="replace")), path)
         except Exception:
             return []
+    if src.mode == "zstd":
+        chunk = zstdio.decode(chunk)
     parse = _parser_for(src.kind, state, path)
     events = []
     for raw in chunk.split(b"\n"):
@@ -392,6 +507,8 @@ def parse_chunk(src, path, chunk, state):
 def _scan_events(sources, since_ts):
     """重扫原始日志，产出 (agent, 事件) 流。跳过 mtime 明显过老的文件（留 1h 余量）。"""
     for src in sources:
+        if not usable(src):
+            continue
         state = {}
         for path in source_files(src):
             try:
@@ -504,8 +621,9 @@ def _prune_minutes(minutes, today=None):
     return minutes
 
 
-def _collect_jsonl(src, path, offsets, state, record):
-    """追加写的 jsonl：从上次的字节偏移往后读，只处理完整行。返回新增事件数。"""
+def _collect_append(src, path, offsets, state, record):
+    """追加写的文件（jsonl / 逐帧追加的 zstd）：从上次的字节偏移往后读，
+    只处理已经写完整的部分。返回新增事件数。"""
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -521,11 +639,11 @@ def _collect_jsonl(src, path, offsets, state, record):
             chunk = f.read()
     except OSError:
         return 0
-    last_nl = chunk.rfind(b"\n")
-    if last_nl < 0:
-        return 0  # 没有完整行（可能正在写入）
-    offsets[path] = offset + last_nl + 1
-    events = parse_chunk(src, path, chunk[:last_nl + 1], state)
+    used = complete_prefix(src.mode, chunk)
+    if not used:
+        return 0  # 还没有写完整的记录（可能正在写入）
+    offsets[path] = offset + used
+    events = parse_chunk(src, path, chunk[:used], state)
     for ev in events:
         record(src.agent, ev)
     return len(events)
@@ -596,15 +714,20 @@ def collect_once(data_dir):
 
     summary = {}
     for src in SOURCES:
+        if not usable(src):
+            continue
         files = source_files(src)
         events = 0
         for path in files:
             if src.mode == "snapshot":
                 events += _collect_snapshot(src, path, snap_ts, snap_mtime, record)
             else:
-                events += _collect_jsonl(src, path, offsets, state, record)
+                events += _collect_append(src, path, offsets, state, record)
         if files:
-            summary[src.agent] = {"files": len(files), "events": events}
+            # 同一个 Agent 可能注册了多个采集源（dsh 压缩与不压缩两种存放），合并计数
+            slot = summary.setdefault(src.agent, {"files": 0, "events": 0})
+            slot["files"] += len(files)
+            slot["events"] += events
 
     if isinstance(state.get("seen_claude"), dict):
         # 按插入顺序保留最近 SEEN_CAP 个。早先这里是 sorted(...)[-CAP:]，

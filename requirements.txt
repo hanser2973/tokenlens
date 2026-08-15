@@ -1,3 +1,8 @@
-# TokenLens 运行仅需 Python 标准库（3.8+）。
-# 以下为可选依赖：安装后以原生窗口运行，未安装则自动回退为浏览器打开。
+# TokenLens 运行仅需 Python 标准库（3.8+）。以下均为可选依赖。
+
+# 安装后以原生窗口运行，未安装则自动回退为浏览器打开。
 pywebview>=5.0
+
+# DeepSeek Harness 的会话日志是 zstd 压缩的，解压需要它（Python 3.14+ 可用标准库
+# compression.zstd，届时这一项不必装）。未安装时只是跳过该采集源，其余工具照常统计。
+zstandard>=0.22

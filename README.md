@@ -26,7 +26,7 @@ python server.py          # 或双击 启动.bat
 python server.py --demo   # 先生成 45 天演示数据再启动
 ```
 
-可选安装 `pywebview` 以原生窗口运行：
+两个可选依赖：`pywebview`（以原生窗口运行）与 `zstandard`（解压 DeepSeek Harness 的会话日志）。
 
 ```bash
 pip install -r requirements.txt
@@ -45,11 +45,30 @@ pip install -r requirements.txt
 | Kimi Code | `~/.kimi-code/sessions/*/*/agents/*/wire.jsonl` | `usage.record` | 会话目录名 `wd_<项目>_<hash>` |
 | Claude Code | `~/.claude/projects/*/*.jsonl` | assistant 消息 `usage`（按 message id 去重） | 每行的 `cwd` |
 | Codex CLI | `~/.codex/sessions/**/rollout-*.jsonl` | `token_count` | `session_meta` / `turn_context` 的 `cwd` |
+| DeepSeek Harness | `~/.dsh/sessions/*/*/session.jsonl.zstd` | `assistant/message` 的 `data.usage` | 会话头（第一帧）的 `cwd` |
 | Cline / Roo Code / Kilo Code | 各 VS Code 系编辑器 `globalStorage/<扩展>/tasks/*/ui_messages.json` | `api_req_started` | 不记录，归入「未知项目」 |
 | opencode | `~/.local/share/opencode/storage/message/*/*.json` | assistant 消息 `tokens` | `path.cwd` |
 
-日志有两种存放方式，扫描策略不同：追加写的 jsonl 按字节偏移增量读；整份重写的 JSON
-（Cline 系、opencode）按 mtime 判断是否重读，靠事件时间戳去重，重读同一份文件不会重复计数。
+日志有三种存放方式，扫描策略不同：追加写的 jsonl 按字节偏移增量读；整份重写的 JSON
+（Cline 系、opencode）按 mtime 判断是否重读，靠事件时间戳去重，重读同一份文件不会重复计数；
+dsh 的日志是**一批追加一个独立 zstd 帧**首尾拼接而成，帧边界天然对齐字节偏移，
+所以同样按偏移增量读，只是读出来要先解帧（尾部半个帧不推进偏移，留到下一轮）。
+
+### DeepSeek Harness 需要一个解压库
+
+zstd 解压要到 Python 3.14 才进标准库（`compression.zstd`）。在那之前需要
+`pip install zstandard`（或 `pyzstd`）—— 三者按 `compression.zstd` → `zstandard` → `pyzstd`
+的顺序探测，任一可用即可。没有解压库时**整源跳过**（不是读了当空数据），采集其他工具
+照常，界面在扫描完成的提示里说明；之后装上库，先前的日志会被完整补采，不需要重建。
+
+不想装库也有办法：在 dsh 的 `settings.yaml` 里把会话持久化配成 `compression: 'none'`，
+它会改写成裸 `.jsonl`，TokenLens 也认（此后新建的会话生效，老的压缩日志仍需解压库）。
+
+用量取的是 `assistant/message` 的 `data.usage`，而不是 `assistant/chunk` 里的 usage 块 ——
+一次成功调用两处各记一遍，只收一处才不会翻倍。dsh 自己的口径是「同一 `(turn, step)`
+用 message 覆盖先前的 chunk 采样」，与只认 message 等价；在真实会话上对过账，合计与
+dsh 自己 `session_projcache.json` 里的 `tokenUsage` 完全一致。代价是某一步失败后重试时，
+失败那次的 token 不计入（dsh 的合计同样不计）。
 
 > Cline 系与 opencode 的解析器按各自公开的存储格式实现，并用固定夹具做了测试，但未在真实安装上验证过；
 > 如果字段有出入，改动只涉及 `collector.py` 里对应的 `parse_*_snapshot` 一个函数。
@@ -103,7 +122,11 @@ token 也未必严格线性（不同模型权重不同）。
 | Codex CLI | `~/.codex/auth.json` | `tokens.account_id`；API Key 模式退回密钥哈希（密钥原文不落盘） |
 | Kimi Code | 官方配额接口响应 | `user.userId`（缓存进 `data/accounts.json`，离线时也能用） |
 
-Cline / opencode 等纯本地日志的工具没有账号概念，不参与匹配。
+Cline / opencode 等纯本地日志的工具没有账号概念，不参与匹配。DeepSeek Harness 也不参与：
+`~/.dsh` 里能拿到的只有一个每台机器随机生成的匿名 id，跨设备对不上，认它反而会把
+同一个账号判成两个。
+
+> 「多端与账号」只影响配额窗口与真实容量。dsh 的用量统计不受影响，照常合并所有设备。
 
 写进共享目录的只有 `sha256(账号 id)` 的前 16 位：同一账号在任何设备上算出的哈希一致，
 足够做匹配，但反推不回邮箱和 uuid，放进网盘也不会把身份带出去。邮箱这类可读信息只留在

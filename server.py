@@ -67,7 +67,8 @@ _collect_lock = threading.Lock()  # 同一时刻只允许一次采集
 _last_collect_at = 0.0
 
 # 供下拉列表使用的常见 Agent 名（实际数据以扫描结果为准）
-KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "Cursor", "Cline", "Trae", "Gemini CLI", "Aider"]
+KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "DeepSeek Harness",
+                "Cursor", "Cline", "Trae", "Gemini CLI", "Aider"]
 
 
 def load_records():
@@ -906,7 +907,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # 采集失败不影响主程序
                 self._send_json({"error": str(e)}, 500)
                 return
-            self._send_json({"ok": True, "summary": summary, "shared": shared})
+            self._send_json({"ok": True, "summary": summary, "shared": shared,
+                             "notes": collector.scan_notes()})
             return
         if url.path == "/api/wallpaper":
             payload = self._read_json()
@@ -964,7 +966,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": f"重建失败：{e}"}, 500)
                 return
-            self._send_json({"ok": True, "summary": summary, "backups": backups})
+            self._send_json({"ok": True, "summary": summary, "backups": backups,
+                             "notes": collector.scan_notes()})
             return
         if url.path == "/api/quota/estimate":
             payload = self._read_json()
