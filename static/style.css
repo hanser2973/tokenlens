@@ -560,6 +560,14 @@ td.dim { color: var(--text-faint); }
 .plan-toolbar .btn-primary,
 .plan-toolbar .btn-ghost { width: auto; flex-shrink: 0; white-space: nowrap; }
 
+.speed-panel { margin-bottom: 20px; }
+.speed-panel .btn-ghost { width: auto; white-space: nowrap; }
+.speed-hint { line-height: 1.7; margin: 0 0 14px; }
+.speed-table { min-width: 1100px; }
+.speed-table td { white-space: nowrap; }
+.speed-table small { display: block; color: var(--text-faint); margin-top: 4px; }
+#speed-status { margin: 12px 0 0; }
+
 /* 配额卡的文案（套餐名 + 重置时间 + 估算说明）比模型卡长得多，单独给一档更宽的列，
    并且按内容高度排列——否则一行里最高那张卡会把其他卡撑出大片空白 */
 #plan-cards {

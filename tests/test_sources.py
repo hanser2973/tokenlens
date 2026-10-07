@@ -99,7 +99,9 @@ class SnapshotDedupTest(unittest.TestCase):
             json.dump(msgs, f)
         # collect_once 靠 mtime 判断要不要重读，测试里手工推进避免同秒写入被当成没变
         st = os.stat(self.path)
-        os.utime(self.path, (st.st_atime, st.st_mtime + 10))
+        stamp = max(st.st_mtime, getattr(self, "last_write_mtime", 0)) + 10
+        self.last_write_mtime = stamp
+        os.utime(self.path, (st.st_atime, stamp))
 
     def _total(self):
         auto = collector._load_json(os.path.join(self.tmp, collector.AUTO_FILE), {})

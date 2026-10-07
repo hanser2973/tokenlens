@@ -771,6 +771,40 @@
       + (n ? ` · ${n} 个模型未定价，点 ✎ 设置` : "");
   }
 
+  let speedRequest = 0;
+  async function renderSpeed(force = false) {
+    const request = ++speedRequest;
+    const params = new URLSearchParams({ agent: state.agent, model: state.model, project: state.project });
+    if (force) params.set("refresh", "1");
+    const bounds = periodBounds();
+    if (bounds) { params.set("from", bounds.from); params.set("to", bounds.to); }
+    const status = $("#speed-status");
+    const rate = (v) => Number.isFinite(v) ? `${v.toFixed(1)} tok/s` : "—";
+    try {
+      const res = await fetch(`/api/speed?${params}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "速度数据加载失败");
+      if (request !== speedRequest || state.view !== "models") return;
+      $("#speed-tbody").innerHTML = (data.rows || []).map((r) => `
+        <tr>
+          <td><b>${esc(r.model)}</b><small>${esc(r.agent)}${r.measurement_basis === "task" ? " · 任务吞吐" : ""}</small></td>
+          <td class="num"><b>${rate(r.stream_tps)}</b></td>
+          <td class="num">${rate(r.latest_stream_tps)}</td>
+          <td class="num">${rate(r.request_tps)}</td>
+          <td class="num"><b>${rate(r.task_tps)}</b></td>
+          <td class="num">${rate(r.latest_task_tps)}</td>
+          <td class="num" title="${r.measurement_basis === "task" ? "Codex 每轮任务首次输出的等待时间" : "单次请求首 token 等待时间"}">${Number.isFinite(r.ttft_seconds) ? `${r.ttft_seconds.toFixed(2)} s` : "—"}</td>
+          <td class="num" title="${r.stream_samples} 条含流式计时，${r.request_samples || 0} 条含请求计时，${r.task_samples || 0} 条任务">${fmtFull(r.samples)}</td>
+          <td>${esc(new Date(r.last_seen * 1000).toLocaleString())}</td>
+        </tr>`).join("") || '<tr><td colspan="9" class="empty">当前筛选下暂无计时样本。完成 Kimi Code、Codex、ZCode 或 opencode 调用后可查看；Codex 需日志包含任务用量与耗时。</td></tr>';
+      status.textContent = `更新于 ${new Date(data.now * 1000).toLocaleTimeString()} · 平均速度 = 总输出 ÷ 总对应耗时。Codex 只统计成功完成的任务，任务吞吐含工具与等待，不能与纯生成速度直接比较；首 token 延迟也是任务口径。`;
+    } catch (e) {
+      if (request !== speedRequest || state.view !== "models") return;
+      $("#speed-tbody").innerHTML = '<tr><td colspan="9" class="empty">速度数据加载失败，点击「刷新速度」重试。</td></tr>';
+      status.textContent = e.message || "速度数据加载失败，请重试";
+    }
+  }
+
   function render() {
     const list = filtered();
     const autoCount = state.records.filter((r) => r.source === "auto").length;
@@ -783,6 +817,7 @@
       renderRanks(list);
     } else if (state.view === "models") {
       renderModelsHint();
+      renderSpeed();
       renderEntityCards(list, "model", "#model-cards", "model");
     } else if (state.view === "agents") {
       renderEntityCards(list, "agent", "#agent-cards", "agent");
@@ -916,6 +951,13 @@
         continue;
       }
       const wins = (a.windows || []).map((w) => {
+        // 官方百分比窗口：方舟及 Kimi 月会员额度不与本机 token 账本外推。
+        if (w.percent_only) {
+          const subs = [];
+          if (w.resets_at) subs.push(fmtReset(w.resets_at));
+          subs.push(esc(w.note || "官方接口仅提供已用百分比（不返回绝对额度），故不做 token 估算"));
+          return planWinHtml(w.used_percent, esc(w.label), subs.join(" · "));
+        }
         const subs = [];
         if (w.resets_at) subs.push(fmtReset(w.resets_at));
         const scope = w.measured_remote
@@ -945,6 +987,8 @@
       cards.push(`
       <div class="card plan-card">
         <div class="card-head"><div class="card-title">${esc(a.agent)} · ${esc(a.plan_type)}</div><span class="card-hint">${esc(a.note || "官方数据")} · ${esc(updated)}</span></div>
+        ${a.plan_note ? `<div class="plan-sub">${esc(a.plan_note)}</div>` : ""}
+        ${a.quota_note ? `<div class="plan-sub">${esc(a.quota_note)}</div>` : ""}
         ${wins}
       </div>`);
     }
@@ -1289,6 +1333,53 @@
       renderPlans();
     });
 
+    // 方舟配额（火山引擎 AK/SK，用于 Coding Plan 官方配额查询）
+    const arkMask = $("#ark-modal-mask");
+    const arkForm = $("#ark-form");
+    const closeArkModal = () => arkMask.classList.remove("show");
+    async function saveArk(payload, okMsg) {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(data.error || "保存失败"); return false; }
+      state.settings = data;
+      toast(okMsg);
+      closeArkModal();
+      renderPlans();
+      return true;
+    }
+    $("#btn-ark").addEventListener("click", async () => {
+      try {
+        const res = await fetch("/api/settings");
+        state.settings = await res.json();
+      } catch (e) { toast("读取设置失败"); return; }
+      const ark = (state.settings && state.settings.ark) || {};
+      arkForm.ark_ak.value = "";
+      arkForm.ark_sk.value = "";
+      arkForm.ark_ak.placeholder = ark.ak_masked ? `当前 ${ark.ak_masked}（留空不修改）` : "AKLT...";
+      $("#ark-status").textContent = ark.configured
+        ? `当前状态：已配置（${ark.source}，AK ${ark.ak_masked}）`
+        : "当前状态：未配置";
+      arkMask.classList.add("show");
+    });
+    $("#ark-modal-close").addEventListener("click", closeArkModal);
+    arkMask.addEventListener("click", (e) => { if (e.target === arkMask) closeArkModal(); });
+    arkForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const payload = {};
+      if (arkForm.ark_ak.value.trim()) payload.ark_ak = arkForm.ark_ak.value.trim();
+      if (arkForm.ark_sk.value.trim()) payload.ark_sk = arkForm.ark_sk.value.trim();
+      if (!Object.keys(payload).length) { toast("没有要保存的修改"); return; }
+      await saveArk(payload, "方舟凭证已保存");
+    });
+    $("#ark-clear").addEventListener("click", async () => {
+      if (!confirm("清除本机保存的火山引擎 AK/SK？")) return;
+      await saveArk({ ark_clear: true }, "已清除方舟凭证");
+    });
+
     const planMask = $("#plan-modal-mask");
     const closePlanModal = () => planMask.classList.remove("show");
     $("#btn-add-plan").addEventListener("click", () => { buildDatalists(); planMask.classList.add("show"); });
@@ -1464,6 +1555,14 @@
   applySkin(false);
   refreshWallpaper();
   bind();
+  $("#btn-refresh-speed").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try { await renderSpeed(true); } finally { btn.disabled = false; }
+  });
+  setInterval(() => {
+    if (!document.hidden && state.view === "models") renderSpeed();
+  }, 15000);
   loadData().then(() => {
     const h = location.hash.slice(1);
     if (VIEW_TITLES[h] && h !== state.view) switchView(h);

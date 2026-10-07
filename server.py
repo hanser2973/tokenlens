@@ -24,6 +24,8 @@ import identity
 import quota
 import storage
 import sync
+import speed
+import volc
 from pricing import load_prices, calc_cost, save_user_price
 
 if getattr(sys, "frozen", False):
@@ -52,7 +54,8 @@ COLLECT_FRESH_WINDOW = 30  # 秒：这段时间内刚采集过，时间线就直
 #              因此隐藏所有绝对估算，只展示可信的百分比与重置时间
 #   sync       多端 + 已配置共享目录 —— 汇总各设备的采集结果，绝对值重新可信
 MULTI_MODES = ("off", "local_only", "sync")
-DEFAULT_SETTINGS = {"multi_device": "off", "sync_dir": ""}
+# ark_ak / ark_sk：火山方舟 Coding Plan 查询用的火山引擎 AK/SK（只存本机，不进同步目录）
+DEFAULT_SETTINGS = {"multi_device": "off", "sync_dir": "", "ark_ak": "", "ark_sk": ""}
 
 # 手动配额的周期定义：标签 + 周期秒数（按滚动窗口统计）
 PLAN_PERIODS = {
@@ -67,7 +70,7 @@ _collect_lock = threading.Lock()  # 同一时刻只允许一次采集
 _last_collect_at = 0.0
 
 # 供下拉列表使用的常见 Agent 名（实际数据以扫描结果为准）
-KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "DeepSeek Harness",
+KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "DeepSeek Harness", "ZCode",
                 "Cursor", "Cline", "Trae", "Gemini CLI", "Aider"]
 
 
@@ -162,6 +165,9 @@ def load_settings():
             s["multi_device"] = d["multi_device"]
         if isinstance(d.get("sync_dir"), str):
             s["sync_dir"] = d["sync_dir"]
+        for k in ("ark_ak", "ark_sk"):
+            if isinstance(d.get(k), str):
+                s[k] = d[k]
     # 声明了 sync 却没有可用目录时降级，避免展示「已合并」的假象
     if s["multi_device"] == "sync" and not s["sync_dir"]:
         s["multi_device"] = "local_only"
@@ -179,10 +185,16 @@ def settings_payload():
     peers = active_peers(s)
     accounts = identity.display_accounts(DATA_DIR)
     hashes = {a["kind"]: a["hash"] for a in accounts}
+    # AK/SK 是凭证：只回「有没有 + 脱敏的 AK」，SK 永远不出 settings.json
+    ark_ak, ark_sk, ark_src = volc.resolve_credentials(s)
     return {
-        **s,
+        "multi_device": s["multi_device"],
+        "sync_dir": s["sync_dir"],
         "device": ident,
         "accounts": accounts,
+        "ark": {"configured": bool(ark_ak and ark_sk),
+                "ak_masked": identity.mask(ark_ak) if ark_ak else "",
+                "source": ark_src or ""},
         "peers": [{"device_name": p["device_name"], "device_id": p["device_id"],
                    "updated": p["updated"], "stale": p["stale"], "days": len(p["days"]),
                    "accounts": _peer_account_match(p, hashes)}
@@ -698,11 +710,18 @@ def compute_plans():
             accounts = identity.local_accounts(DATA_DIR)
             result["accounts"] = identity.display_accounts(DATA_DIR)
         for w in kimi_card.get("windows", []):
+            if w.get("percent_only"):
+                continue
             _estimate_window("kimi", w, peers, hide,
                              account=(accounts.get("kimi") or {}).get("hash"),
                              plan_type=kimi_card.get("plan_type"))
         kimi_card["note"] = "官方接口 · 实时"
     result["auto"].append(kimi_card)
+
+    # 火山方舟 Coding Plan：火山引擎 OpenAPI（AK/SK 签名）实时查询。
+    # 接口只回百分比，本地日志也无法把用量归因到方舟账号 —— 窗口带 percent_only，
+    # 不做绝对额度估算，也不进真实容量观测。
+    result["auto"].append(volc.query_ark(settings))
 
     # Codex：官方 rate_limits 快照，多端时取各设备中最新的一份
     codex_hash = (accounts.get("codex") or {}).get("hash")
@@ -854,6 +873,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(compute_plans())
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
+        elif path == "/api/speed":
+            qs = parse_qs(url.query)
+            date_from, date_to = qs.get("from", [""])[0], qs.get("to", [""])[0]
+            try:
+                for day in (date_from, date_to):
+                    if day:
+                        datetime.strptime(day, "%Y-%m-%d")
+                if date_from and date_to and date_from > date_to:
+                    raise ValueError("日期范围不合法")
+            except ValueError:
+                self._send_json({"error": "from/to 日期范围不合法"}, 400)
+                return
+            try:
+                if qs.get("refresh", [""])[0] == "1":
+                    speed.collect(DATA_DIR, force=True)
+                self._send_json(speed.report(DATA_DIR, date_from, date_to,
+                    qs.get("agent", ["all"])[0], qs.get("model", ["all"])[0],
+                    qs.get("project", ["all"])[0]))
+            except Exception:
+                self._send_json({"error": "速度数据读取失败，请重试"}, 500)
         elif path == "/api/timeline":
             qs = parse_qs(url.query)
             day = qs.get("day", [""])[0]
@@ -929,6 +968,25 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             s = load_settings()
+            # 方舟配额凭证：独立于多端设置更新，改完立即使缓存失效
+            if "ark_ak" in payload or "ark_sk" in payload or payload.get("ark_clear"):
+                if payload.get("ark_clear"):
+                    s["ark_ak"] = s["ark_sk"] = ""
+                else:
+                    # 只填一个时与已保存的另一个合并；都空 = 不修改
+                    ak = str(payload.get("ark_ak") or "").strip() or s["ark_ak"]
+                    sk = str(payload.get("ark_sk") or "").strip() or s["ark_sk"]
+                    if not (ak and sk):
+                        self._send_json({"error": "AccessKey ID 与 Secret Access Key 需同时填写"}, 400)
+                        return
+                    if len(ak) > 200 or len(sk) > 200:
+                        self._send_json({"error": "AK/SK 长度不合法"}, 400)
+                        return
+                    s["ark_ak"], s["ark_sk"] = ak, sk
+                save_settings(s)
+                volc.reset_cache()
+                self._send_json({"ok": True, **settings_payload()})
+                return
             mode = payload.get("multi_device", s["multi_device"])
             if mode not in MULTI_MODES:
                 self._send_json({"error": "multi_device 取值不合法"}, 400)
@@ -950,7 +1008,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
             if payload.get("device_name"):
                 sync.rename_device(DATA_DIR, payload["device_name"])
-            save_settings({"multi_device": mode, "sync_dir": sync_dir})
+            s["multi_device"] = mode
+            s["sync_dir"] = sync_dir
+            save_settings(s)
             shared = None
             if mode == "sync":
                 try:
@@ -1249,6 +1309,7 @@ def collect_loop():
     while True:
         try:
             collect_and_share()
+            speed.collect(DATA_DIR, force=True)
         except Exception:
             pass
         try:

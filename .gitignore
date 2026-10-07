@@ -6,3 +6,7 @@ dist/
 
 # 本机使用数据（含绝对路径等隐私），切勿提交
 data/
+
+# 本地重复打包文件与源码导出；正式入口仍保留 TokenLens.exe
+/TokenLens-*.exe
+/tokenlens-src-*.zip

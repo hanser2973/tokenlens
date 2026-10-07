@@ -133,6 +133,20 @@
         <span class="card-hint" id="models-hint">订阅制模型按官方 API 参考价估算，不代表真实扣费；点卡片上的 ✎ 可改价</span>
         <button class="btn-ghost" id="btn-import-prices">⇓ 从 models.dev 导入官方价格</button>
       </div>
+      <div class="card speed-panel">
+        <div class="card-head">
+          <div class="card-title">模型速度 <span class="card-hint">tok/s</span></div>
+          <button class="btn-ghost" id="btn-refresh-speed">↻ 刷新速度</button>
+        </div>
+        <div class="card-hint speed-hint">生成速度 = 输出 tokens ÷ 流式生成秒数；请求速度包含首 token 等待。Codex 任务吞吐 = 本轮输出 ÷ 整轮耗时（含思考、工具执行与等待）。遵循上方筛选，每 15 秒更新；保留近 30 天最多 20,000 条本机样本。</div>
+        <div class="table-wrap">
+          <table class="table speed-table">
+            <thead><tr><th>模型 / 工具</th><th class="num">平均生成速度</th><th class="num">最近生成速度</th><th class="num">平均请求速度</th><th class="num">平均任务吞吐</th><th class="num">最近任务吞吐</th><th class="num">平均首 token 延迟</th><th class="num">样本数</th><th>最近调用</th></tr></thead>
+            <tbody id="speed-tbody"><tr><td colspan="9" class="empty">正在读取速度数据…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card-hint speed-hint" id="speed-status" role="status">Kimi 可读生成耗时；Codex 新版日志可读任务吞吐；ZCode / opencode 可读请求耗时。缺少可靠计时的日志暂不计算。</div>
+      </div>
       <div class="entity-grid" id="model-cards"></div>
     </section>
 
@@ -186,7 +200,8 @@
     <!-- Plan 用量 -->
     <section id="view-plans" class="view">
       <div class="plan-toolbar">
-        <span class="card-hint">Kimi / Codex 自动读取官方配额；其他工具可添加配额手动跟踪</span>
+        <span class="card-hint">Kimi / Codex / 火山方舟 Coding Plan 自动读取官方配额；其他工具可添加配额手动跟踪</span>
+        <button class="btn-ghost" id="btn-ark">⚡ 方舟配额</button>
         <button class="btn-ghost" id="btn-multi">⇄ 多端设置</button>
         <button class="btn-primary" id="btn-add-plan">＋ 添加配额</button>
       </div>
@@ -296,8 +311,36 @@
   </div>
 </div>
 
-<div class="modal-mask" id="plan-modal-mask">
+<!-- 方舟配额（火山引擎 AK/SK）弹窗 -->
+<div class="modal-mask" id="ark-modal-mask">
   <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">火山方舟 Coding Plan</div>
+      <button class="icon-btn" id="ark-modal-close">✕</button>
+    </div>
+    <form id="ark-form" class="form">
+      <div class="form-row">
+        <label>AccessKey ID</label>
+        <input type="text" name="ark_ak" maxlength="200" autocomplete="off" placeholder="AKLT...">
+      </div>
+      <div class="form-row">
+        <label>Secret Access Key</label>
+        <input type="password" name="ark_sk" maxlength="200" autocomplete="new-password" placeholder="留空表示不修改">
+      </div>
+      <div class="form-tip">
+        查询走的是火山引擎控制面 OpenAPI（GetCodingPlanUsage，签名 V4），只能用账号的
+        AK/SK —— 推理用的 ARK_API_KEY 会被网关拒绝。在火山引擎控制台
+        「访问控制 → 密钥管理」创建；凭证只保存在本机 data/settings.json，不进多端同步。
+        也认环境变量 VOLCENGINE_ACCESS_KEY_ID / VOLCENGINE_SECRET_ACCESS_KEY（界面未配置时）。
+      </div>
+      <div class="form-tip" id="ark-status"></div>
+      <button type="submit" class="btn-primary wide">保存凭证</button>
+      <button type="button" class="btn-ghost wide" id="ark-clear">清除已保存的凭证</button>
+    </form>
+  </div>
+</div>
+
+<div class="modal-mask" id="plan-modal-mask">  <div class="modal">
     <div class="modal-head">
       <div class="modal-title">添加套餐配额</div>
       <button class="icon-btn" id="plan-modal-close">✕</button>

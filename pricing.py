@@ -29,6 +29,11 @@ MODEL_PRICES = {
     "gemini 3 pro":       {"input": 1.25, "output": 10.00},
     "qwen3 coder":        {"input": 0.30, "output": 1.20},
     "doubao seed 1.6":    {"input": 0.25, "output": 2.00},
+    # 智谱 GLM 系列（z.ai / bigmodel 官方参考价；GLM-5 走订阅套餐，未定价时记 0，
+    # models.dev 目录补价或手动定价后即有费用）
+    "glm-4.6":            {"input": 0.60, "output": 2.20, "cache_read": 0.12},
+    "glm-4.5":            {"input": 1.10, "output": 3.80, "cache_read": 0.22},
+    "glm-4.5-air":        {"input": 0.27, "output": 0.85, "cache_read": 0.05},
 }
 CACHED_RATIO = 0.1  # 无 cache_read 价格时，缓存命中 tokens 按输入价 1 折计
 

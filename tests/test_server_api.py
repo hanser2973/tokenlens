@@ -76,6 +76,25 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("records", data)
 
+    def test_speed_api_filters(self):
+        with mock.patch.object(server.speed, "report", return_value={"rows": []}) as report:
+            status, data = self.req("/api/speed?from=2026-09-01&to=2026-10-02&agent=Kimi%20Code&model=k3&project=demo")
+            self.assertEqual(status, 200)
+            self.assertEqual(data["rows"], [])
+            report.assert_called_once_with(server.DATA_DIR, "2026-09-01", "2026-10-02", "Kimi Code", "k3", "demo")
+
+    def test_speed_api_rejects_bad_date_range(self):
+        with mock.patch.object(server.speed, "report") as report:
+            for path in ("/api/speed?from=nope", "/api/speed?from=2026-10-02&to=2026-09-01"):
+                self.assertEqual(self.req(path)[0], 400)
+            report.assert_not_called()
+
+    def test_speed_manual_refresh_scans_immediately(self):
+        with mock.patch.object(server.speed, "collect") as collect, \
+             mock.patch.object(server.speed, "report", return_value={"rows": []}):
+            self.assertEqual(self.req("/api/speed?refresh=1")[0], 200)
+            collect.assert_called_once_with(server.DATA_DIR, force=True)
+
     def test_foreign_host_rejected(self):
         status, _ = self.req("/api/records", headers={"Host": "evil.com"})
         self.assertEqual(status, 403)

@@ -2,22 +2,45 @@
 
 AI / Agent Token 消耗统计看板：自动扫描本机 AI 编程工具的日志，聚合 token 用量、估算费用，并跟踪订阅套餐配额。纯本地运行，数据不上传。
 
+## 应用截图
+
+以下截图由当前版本运行生成，使用隔离的演示数据。Token 用量、费用、模型速度和套餐配额均为展示示例，不代表真实账号数据或性能测量结果。
+
+### 总览
+
+集中查看 Token 消耗、估算费用、请求数、缓存命中率与用量趋势。
+
+![TokenLens 总览：消耗统计、趋势图与模型和 Agent 分布](docs/screenshots/overview.jpg)
+
+### 模型与速度
+
+查看各模型的用量与费用，并分别展示生成速度、请求速度和 Codex 任务吞吐。
+
+![TokenLens 模型页：模型用量、费用与速度统计](docs/screenshots/models.jpg)
+
+### Plan 用量
+
+查看 Kimi Code 套餐与月额度、Codex 窗口用量及火山方舟 Coding Plan 配额。
+
+![TokenLens Plan 页：套餐、窗口用量与月额度](docs/screenshots/plans.jpg)
+
 ## 功能
 
 - **自动采集**：增量扫描各工具的本地日志（只读，不改动原数据），聚合成 日 × Agent × 模型 × 项目 用量
 - **项目维度**：按工作目录区分项目，看清哪个项目最烧钱；支持按项目筛选全站数据
 - **环比对比**：统计卡显示与紧邻的等长上一周期的涨跌幅
 - **费用估算**：内置常见模型参考价；可从 [models.dev](https://models.dev) 一键导入目录价，新模型出现时后台自动匹配补价，也可手动定价
-- **配额跟踪**：Kimi For Coding 官方接口实时查询（含跨设备校准的绝对额度估算）、Codex 本地限额记录、手动配额（固定额度或百分比锚定）；每个窗口可单独「停止 / 开始估计」——多端环境下本机观测口径未必干净时，可以只看官方百分比，或从当前时刻重新锚定
+- **配额跟踪**：Kimi For Coding 官方接口实时查询（含跨设备校准的绝对额度估算）、火山方舟 Coding Plan 官方 OpenAPI 查询（仅百分比，见下方「火山方舟 Coding Plan」）、Codex 本地限额记录、手动配额（固定额度或百分比锚定）；每个窗口可单独「停止 / 开始估计」——多端环境下本机观测口径未必干净时，可以只看官方百分比，或从当前时刻重新锚定
 - **真实容量**：一个窗口从满额跑到用完，实际消耗掉多少 token —— 实测数出来的，不是按百分比外推的，见下方「真实容量」
 - **账号识别**：读取各工具本地凭证里的账号唯一 id，多端汇总按账号对齐，换设备不再算错，见下方「多端与账号」
 - **时间线明细**：任意一天按小时、任意小时按分钟查看用量（近 10 天直接查分钟桶，更早的日期回退为重扫日志）
+- **模型速度**：模型页展示生成 / 请求速度、Codex 平均与最近任务吞吐（tok/s）、首 token 延迟；基于本机完成调用的日志计时，每 15 秒更新
 - **外观**：可换背景壁纸与主题色（星紫 / 初音 / 樱），见下方「外观」
 - **运行形态**：优先 pywebview 原生窗口，未安装则自动回退为浏览器打开
 
 ## 快速开始
 
-**Windows 免安装**：从 Releases 下载 `TokenLens.exe` 双击运行。
+**Windows 免安装**：从 [GitHub Releases](https://github.com/hanser2973/tokenlens/releases/latest) 下载 `TokenLens.exe` 双击运行。
 
 **源码运行**（Python 3.8+，仅依赖标准库）：
 
@@ -48,11 +71,14 @@ pip install -r requirements.txt
 | DeepSeek Harness | `~/.dsh/sessions/*/*/session.jsonl.zstd` | `assistant/message` 的 `data.usage` | 会话头（第一帧）的 `cwd` |
 | Cline / Roo Code / Kilo Code | 各 VS Code 系编辑器 `globalStorage/<扩展>/tasks/*/ui_messages.json` | `api_req_started` | 不记录，归入「未知项目」 |
 | opencode | `~/.local/share/opencode/storage/message/*/*.json` | assistant 消息 `tokens` | `path.cwd` |
+| ZCode | `~/.zcode/cli/db/db.sqlite` | `model_usage` 表（一次模型调用一行，按请求 id 去重） | `session` 表的 `directory` |
 
 日志有三种存放方式，扫描策略不同：追加写的 jsonl 按字节偏移增量读；整份重写的 JSON
 （Cline 系、opencode）按 mtime 判断是否重读，靠事件时间戳去重，重读同一份文件不会重复计数；
 dsh 的日志是**一批追加一个独立 zstd 帧**首尾拼接而成，帧边界天然对齐字节偏移，
 所以同样按偏移增量读，只是读出来要先解帧（尾部半个帧不推进偏移，留到下一轮）。
+ZCode 把账记在自带的 SQLite 里（`model_usage` 表，每行一次调用、带唯一请求 id），
+以只读方式打开（不动应用的数据，WAL 下也能读），增量靠「已收过的请求 id」去重。
 
 ### DeepSeek Harness 需要一个解压库
 
@@ -80,6 +106,58 @@ Cursor / Trae 等把会话存在 IndexedDB、不在本地留 token 明细的工�
 
 升级前采集的历史数据没有项目信息，会归入「未知项目」；在「项目」页点**重建采集数据**
 可清空采集状态重扫全部日志，把项目维度补齐（原数据文件会先备份成 `.bak-<时间戳>`，手动录入的记录不受影响）。
+
+## Kimi Code 套餐与月额度
+
+Plan 页使用本机 Kimi CLI 登录凭证查询官方 `/coding/v1/usages` 和 `/coding/v1/me`，
+显示接口返回的套餐名（例如 Pro）、5 小时 / 周窗口（如接口提供）、**月总额度**与**月 Code 额度**，
+以及各自的重置时间。兼容旧版 `limits` / `usage` 与新版 `usages` 响应；结果缓存 120 秒。
+
+月总额度包含会员的其他 Kimi 产品消耗，月 Code 额度单独展示，两项不能相加。
+月额度仅展示官方已用百分比，不按本机日志估算绝对 token 数；接口缺字段时明确显示未返回，
+不会把未知额度显示成 0%。套餐信息查询失败时，已取得的配额仍会正常展示。
+参考：[官方配额解析源码](https://github.com/MoonshotAI/kimi-code/blob/main/packages/oauth/src/managed-usage.ts)、
+[Kimi Code 权益说明](https://www.kimi.com/help/kimi-code/benefits)。
+
+## 模型速度（tok/s）
+
+打开「模型」页即可查看，并遵循顶部的日期、Agent、模型、项目筛选：
+
+- **生成速度**：输出 token 数 ÷ 流式生成耗时；Kimi 使用 `step.end` 中的 `llmStreamDurationMs`，不含首 token 等待与工具执行，输出含模型思考 token。
+- **请求速度**：输出 token 数 ÷ 请求耗时；Kimi 使用首 token 延迟加流式耗时，旧日志回退到同一次 `llm.request` → `usage.record` 的时间差。
+- **平均速度**：总输出 token ÷ 总对应耗时，避免把长短请求的 tok/s 简单平均。
+- **首 token 延迟**：Kimi 日志中的 `llmFirstTokenLatencyMs`；没有计时字段时显示 `—`。
+- **Codex 任务吞吐**：新版日志的 `token_usage_record.turn_token_usage.output_tokens` ÷ `task_complete.duration_ms`，显示平均与最近任务吞吐。整轮耗时包含思考、工具执行与等待，和单次模型生成 / 请求速度分列展示；首 token 延迟使用任务级 `time_to_first_token_ms`。累计输出已含思考 token，不重复加 `reasoning_output_tokens`，也不累加重复的 `token_count` 快照。
+
+Codex 仅统计成功完成的任务；失败、取消和未完成的任务不结算。没有 `duration_ms` 时可用任务明确的开始 / 结束时间，
+没有任务级 token 记录的旧日志不计算。跨扫描保留未完成任务状态，重复扫描按任务 id 去重；
+同一轮切换多个模型或项目时分别标为「多模型任务」「多项目任务」，避免把整轮耗时重复归给每个模型。
+
+ZCode 使用 `model_usage.started_at` / `completed_at`，opencode 使用消息的 `time.created` / `time.completed`，
+这两类仅显示请求速度，耗时可能包含工具执行。Codex 的纯生成速度与单次请求速度显示 `—`；Claude 等缺少可靠计时的日志暂不计算。
+取消、失败、零输出、无效耗时不作为样本；不足 50ms 的流式窗口不推算生成速度。
+
+速度采集独立于 token 账本，首次打开自动回填已有日志，无需重建；只读已完成记录，
+支持半行与跨扫描续接，重复刷新不会重复计数。样本仅存本机 `data/speed_samples.json`，
+不参与多端同步，保留近 30 天最多 20,000 条。页面可手动刷新并每 15 秒自动更新。
+
+## 火山方舟 Coding Plan
+
+Plan 页自动展示火山方舟 Coding Plan 的用量（与控制台的「当前会话 / 近 1 周 / 近 1 月」一致），
+数据来自火山引擎控制面 OpenAPI `GetCodingPlanUsage`，签名 V4 走
+`open.volcengineapi.com` —— 和推理用的 `ARK_API_KEY` 是两套凭证，必须填账号的
+**AccessKey ID / Secret Access Key**（控制台「访问控制 → 密钥管理」创建）。
+
+配置入口：Plan 页右上「⚡ 方舟配额」。凭证只存本机 `data/settings.json`，不进多端同步；
+也认环境变量 `VOLCENGINE_ACCESS_KEY_ID` / `VOLCENGINE_SECRET_ACCESS_KEY`（界面未配置时兜底）。
+
+注意与 Kimi 卡片的差异：
+
+- 接口**只返回各窗口的已用百分比与重置时间**，不返回绝对 token 额度；
+- 本地日志里的用量记在 Claude Code / dsh 等具体工具名下，无法归因到方舟账号。
+
+所以这张卡片不做绝对额度估算，也不参与真实容量观测——官方百分比与重置时间本身就是
+账号级准确数据，这是「接口给不出」而不是「估不准」。
 
 ## 真实容量
 
@@ -162,10 +240,12 @@ Cline / opencode 等纯本地日志的工具没有账号概念，不参与匹配
 
 - 服务只监听 `127.0.0.1`，并校验 `Host` / `Origin`，可挡 DNS rebinding 与跨站请求
 - `data/` 目录包含你的真实使用数据（含本机文件路径），**不要提交到公开仓库**——本仓库 `.gitignore` 已默认忽略
-- 唯二的外网请求：models.dev 价格目录、Kimi 官方配额接口（使用本机 Kimi CLI 的 OAuth 凭证，
-  为了给真实容量连续观测，后台每 10 分钟查一次）
+- 外网请求仅用于：models.dev 价格目录、Kimi 官方配额 / 套餐接口（使用本机 Kimi CLI 的 OAuth 凭证，
+  为了给真实容量连续观测，后台每 10 分钟查一次）、火山引擎 OpenAPI（你配置的 AK/SK，
+  仅查询 Coding Plan 配额百分比）
 - 账号识别只读取凭证文件里的账号标识字段（accountUuid / account_id / userId），不解析也不外传
-  access_token；进共享目录的只有不可反推的哈希
+  access_token；进共享目录的只有不可反推的哈希。方舟的 AK/SK 只写本机 `data/settings.json`，
+  任何接口响应都不会带出 SK 原文
 
 ## 开发
 

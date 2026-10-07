@@ -10,12 +10,14 @@
 - Claude Code ~/.claude/projects/*/*.jsonl                    （assistant 消息 usage）
 - Codex CLI   ~/.codex/sessions/**/rollout-*.jsonl            （token_count 事件）
 - DeepSeek Harness ~/.dsh/sessions/*/*/session.jsonl.zstd     （assistant/message 事件）
+- ZCode       ~/.zcode/cli/db/db.sqlite                       （model_usage 表，每请求一行）
 
 只读扫描，不修改任何工具的数据。Cursor 等工具不在本地记录 token 明细，无法自动统计。
 """
 import glob
 import json
 import os
+import sqlite3
 import sys
 import storage
 import zstdio
@@ -29,6 +31,8 @@ UNKNOWN_PROJECT = "未知项目"  # 取不到工作目录，以及升级前采�
 SEEN_CAP = 50000  # Claude 消息去重集合上限
 # 分钟桶只用于滚动窗口（5h/每周）的额度估算与多端同步，保留 10 天足够覆盖周窗口
 MINUTES_RETENTION_DAYS = 10
+# SQLite 源（ZCode）已收请求 id 去重集合的保留期：比分钟桶略长，覆盖周窗口即可
+SQLITE_SEEN_RETENTION_DAYS = 15
 
 
 def short_model(name):
@@ -74,7 +78,7 @@ def make_kimi_parser(path):
 
     def parse(line):
         d = json.loads(line)
-        if d.get("type") != "usage.record":
+        if d.get("type") != "usage.record" or d.get("usageScope") == "session":
             return None
         u = d.get("usage") or {}
         ts = (d.get("time") or 0) / 1000
@@ -377,6 +381,69 @@ def parse_opencode_snapshot(data, path):
 SNAPSHOT_PARSERS = {"cline": parse_cline_snapshot, "opencode": parse_opencode_snapshot}
 
 
+# ---------- ZCode（SQLite）----------
+
+def parse_zcode_db(path):
+    """ZCode 桌面端：~/.zcode/cli/db/db.sqlite 的 model_usage 表，一行=一次模型调用。
+
+    它自己就是按请求记的账（logical_request_id 唯一，重试只记成功那次），
+    session 表的 directory 给工作目录，比翻它的 model_io 日志干净得多。
+    只读打开（URI mode=ro），WAL 下也不会动应用的数据；打不开就当没有事件，
+    不让一个正在写库的应用把整轮采集拖垮。
+
+    事件里带 _rid（logical_request_id）供增量去重，事件之外没人用。
+    """
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % str(path).replace("\\", "/"), uri=True)
+    except (sqlite3.Error, OSError):
+        return []
+    try:
+        rows = con.execute(
+            """
+            SELECT m.logical_request_id, m.model_id, m.status, m.completed_at, m.started_at,
+                   m.input_tokens, m.output_tokens,
+                   m.cache_creation_input_tokens, m.cache_read_input_tokens,
+                   s.directory
+            FROM model_usage m
+            LEFT JOIN session s ON s.id = m.session_id
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    events = []
+    for r in rows:
+        rid, model_id, status, completed, started, inp, out, cache_w, cache_r, directory = r
+        if status and status != "completed":
+            continue  # 失败的调用不计费，库里通常也只有 completed
+        try:
+            ts = float(completed or started or 0) / 1000
+        except (TypeError, ValueError):
+            continue
+        if not ts:
+            continue
+        inp = int(inp or 0)
+        out = int(out or 0)
+        cache_w = int(cache_w or 0)
+        cache_r = int(cache_r or 0)
+        if inp + out + cache_w + cache_r == 0:
+            continue
+        events.append({
+            "ts": ts,
+            "project": project_of(directory),
+            "model": short_model(model_id),
+            "input": inp + cache_w,   # 缓存写入按输入计，与其他采集源口径一致
+            "output": out,
+            "cached": cache_r,
+            "_rid": str(rid or ""),
+        })
+    return events
+
+
+SQL_PARSERS = {"zcode": parse_zcode_db}
+
+
 # ---------- 采集源注册表 ----------
 # mode 决定怎么扫：
 #   jsonl    追加写的 jsonl，按字节偏移增量读（Kimi / Claude / Codex）
@@ -384,6 +451,7 @@ SNAPSHOT_PARSERS = {"cline": parse_cline_snapshot, "opencode": parse_opencode_sn
 #            读出来要先解帧（DeepSeek Harness）
 #   snapshot 整份重写的 JSON 文件，按 mtime 判断是否要重读，靠时间戳去重
 #            （Cline 系扩展的 ui_messages.json、opencode 的单条消息 JSON）
+#   sqlite   每次读库，按请求唯一 id 去重（ZCode 的 db.sqlite）
 Source = namedtuple("Source", "agent patterns kind mode")
 
 
@@ -416,6 +484,8 @@ SOURCES = [
     Source("opencode",    ["~/.local/share/opencode/storage/message/*/*.json",
                            "~/AppData/Local/opencode/storage/message/*/*.json"],
            "opencode", "snapshot"),
+    # ZCode 桌面端把每次模型调用记在自己的 SQLite 里（model_usage 表），按请求 id 去重
+    Source("ZCode",       ["~/.zcode/cli/db/db.sqlite"], "zcode", "sqlite"),
 ]
 
 _AGENT_KINDS = {s.agent: s.kind for s in SOURCES}
@@ -477,6 +547,7 @@ def parse_chunk(src, path, chunk, state):
     """把一个文件的字节内容解析成事件列表，屏蔽几种存放方式的差异。
 
     jsonl 逐行解析；zstd 先解帧再逐行解析；snapshot 整份 JSON 交给对应解析器。
+    sqlite / jsonl 之外的整份数据源由调用方直接走对应解析器（不走这里）。
     解析失败一律当作没有事件，不让某个工具的格式变动拖垮整轮采集。
     """
     if src.mode == "snapshot":
@@ -485,6 +556,14 @@ def parse_chunk(src, path, chunk, state):
             return []
         try:
             return parser(json.loads(chunk.decode("utf-8", errors="replace")), path)
+        except Exception:
+            return []
+    if src.mode == "sqlite":
+        parser = SQL_PARSERS.get(src.kind)
+        if not parser:
+            return []
+        try:
+            return parser(path)
         except Exception:
             return []
     if src.mode == "zstd":
@@ -511,13 +590,16 @@ def _scan_events(sources, since_ts):
             continue
         state = {}
         for path in source_files(src):
-            try:
-                if os.path.getmtime(path) < since_ts - 3600:
+            if src.mode != "sqlite":
+                try:
+                    if os.path.getmtime(path) < since_ts - 3600:
+                        continue
+                    with open(path, "rb") as f:
+                        chunk = f.read()
+                except OSError:
                     continue
-                with open(path, "rb") as f:
-                    chunk = f.read()
-            except OSError:
-                continue
+            else:
+                chunk = b""  # sqlite 解析器直接按路径读库，不吃文件字节
             for ev in parse_chunk(src, path, chunk, state):
                 yield src.agent, ev
 
@@ -621,6 +703,18 @@ def _prune_minutes(minutes, today=None):
     return minutes
 
 
+def _prune_seen_sqlite(seen, now=None):
+    """丢弃早于保留期的 SQLite 请求 id（值是秒级时间戳），就地修改并返回同一个 dict。"""
+    if now is None:
+        now = datetime.now().timestamp()
+    elif isinstance(now, datetime):
+        now = now.timestamp()
+    cutoff = now - SQLITE_SEEN_RETENTION_DAYS * 86400
+    for key in [k for k, ts in seen.items() if not isinstance(ts, (int, float)) or ts < cutoff]:
+        del seen[key]
+    return seen
+
+
 def _collect_append(src, path, offsets, state, record):
     """追加写的文件（jsonl / 逐帧追加的 zstd）：从上次的字节偏移往后读，
     只处理已经写完整的部分。返回新增事件数。"""
@@ -682,6 +776,31 @@ def _collect_snapshot(src, path, snap_ts, snap_mtime, record):
     return n
 
 
+def _collect_sqlite(src, path, seen_sqlite, record):
+    """SQLite 源（ZCode）：库里每一行就是一次模型调用，自带唯一 logical_request_id。
+
+    没有字节偏移可借，增量靠「已收过哪些请求 id」去重：只收本轮见到、集合里没有的
+    新 id。集合按「id -> 时间戳」存盘，定期按时间裁剪，避免老库无限增长。
+    返回新增事件数。
+    """
+    prefix = f"{src.kind}:"
+    observed_at = datetime.now().timestamp()
+    n = 0
+    for ev in parse_chunk(src, path, b"", {}):
+        rid = ev.pop("_rid", "") or ""
+        key = prefix + rid
+        if rid and key in seen_sqlite:
+            seen_sqlite[key] = observed_at
+            continue
+        if rid:
+            # 按最近看见请求的时间保留，而不是请求发生时间：老记录仍在库里时，
+            # 按事件时间裁剪会在每轮扫描后忘掉 id，下一轮把历史用量再加一遍。
+            seen_sqlite[key] = observed_at
+        record(src.agent, ev)
+        n += 1
+    return n
+
+
 def collect_once(data_dir):
     """增量扫描一次，返回 {agent: {"files": n, "events": n}} 摘要。"""
     state_path = os.path.join(data_dir, STATE_FILE)
@@ -697,6 +816,9 @@ def collect_once(data_dir):
 
     snap_ts = state.setdefault("snapshot_ts", {})
     snap_mtime = state.setdefault("snapshot_mtime", {})
+    seen_sqlite = state.setdefault("seen_sqlite", {})
+    if not isinstance(seen_sqlite, dict):
+        seen_sqlite = state["seen_sqlite"] = {}
 
     def record(agent, ev):
         dt = datetime.fromtimestamp(ev["ts"])
@@ -721,6 +843,8 @@ def collect_once(data_dir):
         for path in files:
             if src.mode == "snapshot":
                 events += _collect_snapshot(src, path, snap_ts, snap_mtime, record)
+            elif src.mode == "sqlite":
+                events += _collect_sqlite(src, path, seen_sqlite, record)
             else:
                 events += _collect_append(src, path, offsets, state, record)
         if files:
@@ -729,6 +853,7 @@ def collect_once(data_dir):
             slot["files"] += len(files)
             slot["events"] += events
 
+    _prune_seen_sqlite(seen_sqlite)
     if isinstance(state.get("seen_claude"), dict):
         # 按插入顺序保留最近 SEEN_CAP 个。早先这里是 sorted(...)[-CAP:]，
         # message id 是随机串，按字典序排完取尾部等于随机丢一半 —— 被丢掉的 id
