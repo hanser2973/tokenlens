@@ -72,6 +72,7 @@ pip install -r requirements.txt
 | Cline / Roo Code / Kilo Code | 各 VS Code 系编辑器 `globalStorage/<扩展>/tasks/*/ui_messages.json` | `api_req_started` | 不记录，归入「未知项目」 |
 | opencode | `~/.local/share/opencode/storage/message/*/*.json` | assistant 消息 `tokens` | `path.cwd` |
 | ZCode | `~/.zcode/cli/db/db.sqlite` | `model_usage` 表（一次模型调用一行，按请求 id 去重） | `session` 表的 `directory` |
+| Google Antigravity（App / IDE / CLI） | `~/.gemini/antigravity*/conversations/*.db` | `gen_metadata` 的 protobuf 用量（按响应 id 去重） | `trajectory_metadata_blob` 的 workspace URI |
 
 日志有三种存放方式，扫描策略不同：追加写的 jsonl 按字节偏移增量读；整份重写的 JSON
 （Cline 系、opencode）按 mtime 判断是否重读，靠事件时间戳去重，重读同一份文件不会重复计数；
@@ -79,6 +80,22 @@ dsh 的日志是**一批追加一个独立 zstd 帧**首尾拼接而成，帧边
 所以同样按偏移增量读，只是读出来要先解帧（尾部半个帧不推进偏移，留到下一轮）。
 ZCode 把账记在自带的 SQLite 里（`model_usage` 表，每行一次调用、带唯一请求 id），
 以只读方式打开（不动应用的数据，WAL 下也能读），增量靠「已收过的请求 id」去重。
+
+### Google Antigravity
+
+自动读取 Antigravity App、IDE 与 CLI 的本地会话数据库，统一显示为 **Antigravity**。
+支持按日期、模型、项目查看输入、输出、缓存 token 与调用数；无需填写 Google 凭证或保持 Antigravity 打开。
+CLI 自定义数据目录时遵循 `GEMINI_CLI_HOME`。更新后点「同步本地数据」即可补采已有会话，无需重建其他工具的数据。
+
+输入包含日志记录的固定系统提示与新增输入，缓存读取单独统计；输出已包含思考 token，不重复累加。
+新版调用时间从 `steps` 表按响应 id 或明确的 generation index 关联，旧版读取调用内的时间戳。
+缺少调用时间、损坏或超过 1 MiB 的记录会跳过并在同步提示中说明，不用会话创建时间或文件修改时间代替。
+缺少 workspace 时归入「未知项目」。重复扫描与多个目录中的同一响应不会重复计数。
+
+这是本机已保存的调用用量，**不等于 Google 账号的剩余配额或订阅账单**；费用沿用模型 API 参考价估算，未知模型会提示未定价。
+本次支持 token 统计，尚未接入 Antigravity 在线套餐配额或速度监测。
+本地 protobuf 格式未公开，字段依据本机数据及 [tokscale 解析器](https://github.com/junhoyeo/tokscale/blob/main/crates/tokscale-core/src/sessions/antigravity_cli.rs)
+交叉核对；后续版本若改变格式，可能需要更新解析器。
 
 ### DeepSeek Harness 需要一个解压库
 

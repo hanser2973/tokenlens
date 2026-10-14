@@ -11,6 +11,7 @@
 - Codex CLI   ~/.codex/sessions/**/rollout-*.jsonl            （token_count 事件）
 - DeepSeek Harness ~/.dsh/sessions/*/*/session.jsonl.zstd     （assistant/message 事件）
 - ZCode       ~/.zcode/cli/db/db.sqlite                       （model_usage 表，每请求一行）
+- Antigravity ~/.gemini/antigravity*/conversations/*.db       （gen_metadata 用量）
 
 只读扫描，不修改任何工具的数据。Cursor 等工具不在本地记录 token 明细，无法自动统计。
 """
@@ -19,6 +20,7 @@ import json
 import os
 import sqlite3
 import sys
+import antigravity
 import storage
 import zstdio
 from collections import namedtuple
@@ -441,7 +443,7 @@ def parse_zcode_db(path):
     return events
 
 
-SQL_PARSERS = {"zcode": parse_zcode_db}
+SQL_PARSERS = {"zcode": parse_zcode_db, "antigravity": antigravity.read_events}
 
 
 # ---------- 采集源注册表 ----------
@@ -451,7 +453,7 @@ SQL_PARSERS = {"zcode": parse_zcode_db}
 #            读出来要先解帧（DeepSeek Harness）
 #   snapshot 整份重写的 JSON 文件，按 mtime 判断是否要重读，靠时间戳去重
 #            （Cline 系扩展的 ui_messages.json、opencode 的单条消息 JSON）
-#   sqlite   每次读库，按请求唯一 id 去重（ZCode 的 db.sqlite）
+#   sqlite   每次读库，按请求唯一 id 去重（ZCode / Antigravity）
 Source = namedtuple("Source", "agent patterns kind mode")
 
 
@@ -486,6 +488,7 @@ SOURCES = [
            "opencode", "snapshot"),
     # ZCode 桌面端把每次模型调用记在自己的 SQLite 里（model_usage 表），按请求 id 去重
     Source("ZCode",       ["~/.zcode/cli/db/db.sqlite"], "zcode", "sqlite"),
+    Source("Antigravity", antigravity.patterns(), "antigravity", "sqlite"),
 ]
 
 _AGENT_KINDS = {s.agent: s.kind for s in SOURCES}
@@ -519,6 +522,8 @@ def scan_notes():
     if blocked:
         notes.append(f"{'、'.join(blocked)} 的会话日志是 zstd 压缩的，"
                      f"本机没有解压库，已跳过；装上即可采集：pip install zstandard")
+    paths = [p for src in SOURCES if src.kind == "antigravity" for p in source_files(src)]
+    notes.extend(antigravity.scan_notes(paths))
     return notes
 
 
@@ -585,6 +590,7 @@ def parse_chunk(src, path, chunk, state):
 
 def _scan_events(sources, since_ts):
     """重扫原始日志，产出 (agent, 事件) 流。跳过 mtime 明显过老的文件（留 1h 余量）。"""
+    seen_sqlite = set()
     for src in sources:
         if not usable(src):
             continue
@@ -601,6 +607,11 @@ def _scan_events(sources, since_ts):
             else:
                 chunk = b""  # sqlite 解析器直接按路径读库，不吃文件字节
             for ev in parse_chunk(src, path, chunk, state):
+                if src.mode == "sqlite" and ev.get("_rid"):
+                    key = (src.kind, ev["_rid"])
+                    if key in seen_sqlite:
+                        continue
+                    seen_sqlite.add(key)
                 yield src.agent, ev
 
 
@@ -777,7 +788,7 @@ def _collect_snapshot(src, path, snap_ts, snap_mtime, record):
 
 
 def _collect_sqlite(src, path, seen_sqlite, record):
-    """SQLite 源（ZCode）：库里每一行就是一次模型调用，自带唯一 logical_request_id。
+    """SQLite 源：每个事件带模型调用的唯一 id（ZCode / Antigravity）。
 
     没有字节偏移可借，增量靠「已收过哪些请求 id」去重：只收本轮见到、集合里没有的
     新 id。集合按「id -> 时间戳」存盘，定期按时间裁剪，避免老库无限增长。

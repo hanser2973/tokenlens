@@ -70,7 +70,7 @@ _collect_lock = threading.Lock()  # 同一时刻只允许一次采集
 _last_collect_at = 0.0
 
 # 供下拉列表使用的常见 Agent 名（实际数据以扫描结果为准）
-KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "DeepSeek Harness", "ZCode",
+KNOWN_AGENTS = ["Kimi Code", "Claude Code", "Codex CLI", "DeepSeek Harness", "ZCode", "Antigravity",
                 "Cursor", "Cline", "Trae", "Gemini CLI", "Aider"]
 
 
